@@ -1,7 +1,8 @@
-numpy
-pandas
-scipy
-scikit-learn
-streamlit
-plotly
-openpyxl
+numpy>=1.26,<2.1
+pandas>=2.0,<2.3
+scipy>=1.11,<1.15
+scikit-learn>=1.3,<1.6
+streamlit>=1.35,<1.45
+plotly>=5.18,<6.0
+openpyxl>=3.1,<3.3
+altair>=5.0,<6.0
