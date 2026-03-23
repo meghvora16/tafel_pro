@@ -331,54 +331,85 @@ def classify_curve(cat_res, an_res):
     return CT.A
 
 
-def assemble_p0(Ecorr, cat_res, an_res, ct, Emax):
-    """Build initial parameter vector from separate fits."""
+def assemble_p0(E, i, Ecorr, cat_res, an_res, ct, Emax):
+    """Build initial parameter vector from separate fits + data scanning."""
     ic = cat_res["icorr"]
     bc1 = cat_res["bc1"]
     iL = cat_res.get("iL_fit", ic*1e4)
     ba = an_res["ba"]
+    ai = np.abs(i)
+
+    # For passive models: scan data for passive region even if pre-fit missed it
+    Epp_est = an_res.get("Epp") or Ecorr + 0.25
+    ipass_est = an_res.get("ipass") or ic * 0.01
+    Eb_est = an_res.get("Eb") or Epp_est + 0.30
+
+    if ct in CT.PASS:
+        # Scan anodic region for minimum current (likely passive region)
+        an_mask = (E > Ecorr + 0.03) & (E < Emax - 0.05)
+        if np.sum(an_mask) > 8:
+            E_an = E[an_mask]; ai_an = ai[an_mask]
+            lg_an = slog(ai_an)
+            lg_sm = sm(lg_an, min(11, max(5, (np.sum(an_mask)//3)*2-1)))
+            # Find the minimum in the smoothed log|i| — that's the passive region
+            min_idx = np.argmin(lg_sm)
+            if min_idx > 1 and min_idx < len(lg_sm) - 1:
+                Epp_est = float(E_an[max(0, min_idx - 3)])
+                ipass_est = float(10**lg_sm[min_idx])
+                # Breakdown: where current rises sharply after the minimum
+                if min_idx < len(lg_sm) - 5:
+                    post = lg_sm[min_idx:]
+                    dlg = np.gradient(post)
+                    rise = np.where(dlg > 1.0)[0]
+                    if len(rise) > 0:
+                        Eb_est = float(E_an[min_idx + rise[0]])
 
     return np.array([
         Ecorr, ic, ba, bc1, iL,
         cat_res["i0_c2"], cat_res["bc2"],
-        an_res.get("Epp") or Emax+10,
-        40.0 if an_res["has_passive"] else 50.0,
-        an_res.get("ipass") or ic,
-        an_res.get("Eb") or Emax+10,
-        (an_res.get("ipass") or ic)*0.01 if an_res["has_tp"] else 1e-30,
-        8.0,
-        Emax+20, 50.0, ic, 0.0
+        Epp_est if ct in CT.PASS else Emax+10,
+        40.0 if ct in CT.PASS else 50.0,
+        ipass_est if ct in CT.PASS else ic,
+        Eb_est if ct in ["PT","F"] else Emax+10,
+        (ipass_est*0.01) if ct in ["PT","F"] else 1e-30,
+        8.0, Emax+20, 50.0, ic, 0.0
     ])
 
 
 def global_polish(E, i, p0, ct, fit_rs=False, rs_max=200.0):
     """
-    Light global optimization using the separate-fit initial guess.
-    Much faster than full DE — just refines the combined model.
+    Global optimization with multi-start for robustness.
+    Uses the separate-fit p0 + a perturbed variant to avoid local minima.
     """
     ld = slog(i)
     n = len(E)
     fidx = CT.idx(ct) + ([16] if fit_rs else [])
     nf = len(fidx)
 
-    # Bounds
+    # Bounds — wide enough for any electrochemical system
     Emax, Emin = float(np.max(E)), float(np.min(E))
     ic = max(p0[1], 1e-14)
+    
+    # Use data-derived bounds where possible
+    ai = np.abs(i)
+    i_min = float(np.percentile(ai[ai > 0], 5)) if np.any(ai > 0) else 1e-12
+    i_max = float(np.max(ai))
+    
     lo = np.array([
-        Emin, max(ic*1e-4,1e-15), 0.01, 0.01, max(ic*0.1,1e-10),
-        max(ic*1e-8,1e-18), 0.04,
+        Emin, max(i_min*1e-3, 1e-15), 0.010, 0.010, max(i_min*0.1, 1e-12),
+        1e-18, 0.04,
         Emin if ct in CT.PASS else Emax+5, 5.0,
-        max(ic*1e-5,1e-15) if ct in CT.PASS else 1e-15,
+        max(i_min*0.01, 1e-15) if ct in CT.PASS else 1e-15,
         Emin if ct in ["PT","F"] else Emax+5, 1e-30, 0.5,
-        Emin if ct == "F" else Emax+10, 5.0, max(ic*1e-5,1e-15), 0.0
+        Emin if ct == "F" else Emax+10, 5.0, max(i_min*0.01, 1e-15), 0.0
     ])
     hi = np.array([
-        Emax, min(ic*1e5,1e1), 0.5, 0.5, max(ic*1e6,1e0),
-        max(ic*100,1e-4), 0.4,
+        Emax, min(i_max*10, 1e2), 0.500, 0.500, max(i_max*100, 1e0),
+        max(i_max, 1e-4), 0.400,
         Emax if ct in CT.PASS else Emax+15, 200.0,
-        max(ic*1e3,1e-2) if ct in CT.PASS else 1e-2,
-        Emax+0.2 if ct in ["PT","F"] else Emax+15, max(ic*1e4,1e-6), 40.0,
-        Emax+0.5 if ct=="F" else Emax+25, 200.0, max(ic*1e3,1e-2), rs_max
+        max(i_max, 1e-2) if ct in CT.PASS else 1e-2,
+        Emax+0.2 if ct in ["PT","F"] else Emax+15, max(i_max, 1e-6), 40.0,
+        Emax+0.5 if ct=="F" else Emax+25, 200.0, max(i_max, 1e-2), rs_max
     ])
     for j in range(NP):
         if lo[j] >= hi[j]:
@@ -395,7 +426,6 @@ def global_polish(E, i, p0, ct, fit_rs=False, rs_max=200.0):
                 if j in LOG_P else (lo[j],hi[j]) for j in fidx]
     def obj(x):
         p = unpack(x)
-        if p[1] < 1e-14 or p[1] > 0.1: return 1e30
         try: return float(np.sum((ld - slog(pol_model(E,p)))**2))
         except: return 1e30
 
@@ -406,9 +436,9 @@ def global_polish(E, i, p0, ct, fit_rs=False, rs_max=200.0):
         s = obj(x)
         if s < best_s: best_p, best_s = unpack(x), s
 
-    # DE (moderate — not exhaustive)
+    # DE global search
     try:
-        ps = max(10, min(15, nf*2)); mi = max(150, min(400, nf*30))
+        ps = max(10, min(15, nf*2)); mi = max(200, min(500, nf*30))
         res = differential_evolution(obj, bnds, seed=42, maxiter=mi, popsize=ps,
             tol=1e-12, mutation=(0.5,1.7), recombination=0.85, polish=False, workers=1)
         up(res.x)
@@ -425,6 +455,13 @@ def global_polish(E, i, p0, ct, fit_rs=False, rs_max=200.0):
     try:
         r = minimize(obj, pack(best_p), method="Nelder-Mead",
             options={"maxiter": 10000, "xatol": 1e-13, "fatol": 1e-15, "adaptive": True})
+        up(r.x)
+    except: pass
+    
+    # Powell (extra polish)
+    try:
+        r = minimize(obj, pack(best_p), method="Powell",
+            options={"maxiter": 8000, "xtol": 1e-13, "ftol": 1e-15})
         up(r.x)
     except: pass
 
@@ -728,7 +765,7 @@ def main():
 
         results = []
         for ct_try in candidates:
-            p0 = assemble_p0(Ecorr, cat, an, ct_try, Emax)
+            p0 = assemble_p0(E, i, Ecorr, cat, an, ct_try, Emax)
             bp_try, r2_try, aic_try = global_polish(E, i, p0, ct_try, fit_rs, rs_max)
             results.append(dict(ct=ct_try, r2=r2_try, aicc=aic_try, bp=bp_try))
             st.write(f"  {CT.name(ct_try)}: R²={r2_try:.6f}, AICc={aic_try:.0f}")
