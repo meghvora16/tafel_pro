@@ -719,6 +719,7 @@ def main():
         candidates = [ct_detected]
         if CT.AD not in candidates: candidates.append(CT.AD)
         # If anodic scan extends >0.3V past Ecorr, always try passive models
+        Emax = float(np.max(E))
         anodic_range = Emax - Ecorr
         if anodic_range > 0.25 and CT.PD not in candidates:
             candidates.append(CT.PD)
@@ -726,7 +727,6 @@ def main():
             candidates.append(CT.PT)
 
         results = []
-        Emax = float(np.max(E))
         for ct_try in candidates:
             p0 = assemble_p0(Ecorr, cat, an, ct_try, Emax)
             bp_try, r2_try, aic_try = global_polish(E, i, p0, ct_try, fit_rs, rs_max)
