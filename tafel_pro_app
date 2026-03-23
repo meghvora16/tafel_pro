@@ -280,8 +280,9 @@ def _extract_features(E, i, n_feat=60):
     return np.array(feats, dtype=float)
 
 
-@st.cache_resource(show_spinner="Training ML classifier on synthetic data...")
-def build_classifier(n_samples=300, seed=42):
+@st.cache_resource(show_spinner="🤖 Training ML classifier (~3s)...")
+def build_classifier(n_samples=50, seed=42):
+    """Fast self-training classifier. 50 samples/class ≈ 1.5s on Streamlit Cloud."""
     rng = np.random.RandomState(seed)
     X_all, y_all = [], []
     types = [CT.ACTIVE, CT.ACTIVE_D, CT.ACTIVE_H2,
@@ -311,14 +312,15 @@ def build_classifier(n_samples=300, seed=42):
     X, y = np.array(X_all), np.array(y_all)
     scaler = StandardScaler()
     X_s = scaler.fit_transform(X)
-    clf = RandomForestClassifier(n_estimators=200, max_depth=15,
-        min_samples_leaf=5, random_state=seed, n_jobs=-1, class_weight='balanced')
+    clf = RandomForestClassifier(n_estimators=100, max_depth=12,
+        min_samples_leaf=3, random_state=seed, n_jobs=1, class_weight='balanced')
     clf.fit(X_s, y)
     return clf, scaler
 
 
-@st.cache_resource(show_spinner="Training neural surrogate...")
-def build_surrogate(n_samples=300, seed=42):
+@st.cache_resource(show_spinner="🧠 Training neural surrogate (~1s)...")
+def build_surrogate(n_samples=50, seed=42):
+    """Fast self-training surrogate. 50 samples/class ≈ 1s on Streamlit Cloud."""
     rng = np.random.RandomState(seed)
     X_all, y_all = [], []
     p_lo = np.array([-1.5, -10, 0.01, 0.01, -8, -12, 0.04,
@@ -354,8 +356,8 @@ def build_surrogate(n_samples=300, seed=42):
     X, Y = np.array(X_all), np.array(y_all)
     scaler = StandardScaler()
     X_s = scaler.fit_transform(X)
-    net = MLPRegressor(hidden_layer_sizes=(128, 64, 32), activation='relu',
-        solver='adam', max_iter=500, random_state=seed, early_stopping=True,
+    net = MLPRegressor(hidden_layer_sizes=(64, 32), activation='relu',
+        solver='adam', max_iter=200, random_state=seed, early_stopping=True,
         validation_fraction=0.15, learning_rate='adaptive', alpha=0.001)
     net.fit(X_s, Y)
     return net, scaler, p_lo, p_hi
@@ -862,17 +864,16 @@ def main():
                                  disabled=not fit_rs)
         auto_run = st.checkbox("Auto-fit on upload", value=True)
 
-        st.subheader("🤖 ML Models")
-        n_train = st.slider("Training samples per class", 100, 1000, 300, 50,
-                            help="More samples → better classifier, slower startup")
+        st.subheader("🤖 ML Pipeline")
+        st.caption("Self-trained on synthetic data at startup (~3s)")
 
         st.markdown("---")
-        st.caption("Pipeline: RF Classifier → Neural Surrogate → "
-                   "Separate Pre-Fit → DE+L-BFGS-B+NM+Powell → AICc Selection")
+        st.caption("RF Classifier → Neural Surrogate → "
+                   "Separate Pre-Fit → DE+LBFGS+NM+Powell → AICc")
 
-    # ── Build ML models (cached) ──
-    clf, clf_scaler = build_classifier(n_samples=n_train)
-    surr, surr_scaler, surr_lo, surr_hi = build_surrogate(n_samples=n_train)
+    # ── Build ML models (cached — only runs once) ──
+    clf, clf_scaler = build_classifier()
+    surr, surr_scaler, surr_lo, surr_hi = build_surrogate()
 
     # ── Main content ──
     if uploaded is None:
