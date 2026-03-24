@@ -197,18 +197,48 @@ def pol_model(E, p, ct="PT"):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def detect_ecorr(E, i):
-    """Interpolated zero-crossing of signed current."""
-    sc = np.where(np.diff(np.sign(i)))[0]
+    """
+    Robust Ecorr detection — always finds the TRUE corrosion potential.
+
+    Active-passive curves cross zero multiple times:
+      (1) True Ecorr: cathodic→anodic at the corrosion potential (lowest E)
+      (2) Repassivation: anodic→cathodic at the active peak
+      (3) Transpassive: cathodic→anodic again at high E
+
+    Fix: always pick the MOST CATHODIC (lowest E) cathodic→anodic crossing.
+    The first crossing [0] is wrong when repassivation creates an earlier crossing.
+    This matches the batch_tafel.py _robust_ecorr() logic.
+    """
+    E = np.asarray(E, float); i = np.asarray(i, float)
+    # Ensure sorted by E
+    si = np.argsort(E); Es = E[si]; is_ = i[si]
+
+    sc = np.where(np.diff(np.sign(is_)))[0]
     if len(sc) == 0:
-        idx = int(np.argmin(np.abs(i)))
-        return float(E[idx]), idx
-    # Prefer cathodic→anodic crossing (negative→positive)
-    anodic_cross = [k for k in sc if i[k] < 0 and i[k+1] > 0]
-    idx_sc = anodic_cross[0] if anodic_cross else sc[0]
-    denom  = i[idx_sc+1] - i[idx_sc]
-    Ecorr  = float(E[idx_sc] - i[idx_sc] * (E[idx_sc+1] - E[idx_sc]) / denom) \
-             if abs(denom) > TINY else float(E[idx_sc])
-    return Ecorr, idx_sc
+        idx = int(np.argmin(np.abs(is_)))
+        return float(Es[idx]), int(si[idx])
+
+    # Collect all crossings with interpolated E position
+    crossings = []
+    for k in sc:
+        denom = is_[k+1] - is_[k]
+        if abs(denom) < TINY: continue
+        Ec = float(Es[k] - is_[k] * (Es[k+1] - Es[k]) / denom)
+        goes_anodic = (is_[k] < 0 and is_[k+1] > 0)
+        crossings.append((Ec, int(si[k]), goes_anodic))
+
+    if not crossings:
+        idx = int(np.argmin(np.abs(is_)))
+        return float(Es[idx]), int(si[idx])
+
+    # True Ecorr = MOST CATHODIC cathodic→anodic crossing
+    anodic = [(Ec, idx) for Ec, idx, ga in crossings if ga]
+    if anodic:
+        return min(anodic, key=lambda x: x[0])   # lowest E wins
+
+    # Fallback: most cathodic crossing of any sign
+    best = min(crossings, key=lambda x: x[0])
+    return best[0], best[1]
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STAGE 2 — CATHODIC BRANCH FIT
