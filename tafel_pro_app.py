@@ -692,18 +692,24 @@ def make_figure(E, i_obs, best_p, ct, sample_name,
     r2v  = r2_score(log_obs, log_fitE)
     rmse = float(np.sqrt(np.mean(residuals**2)))
 
-    # Y-axis limits: show full cathodic arm (y_lo = data minimum),
-    # cap y_hi to keep active/passive/Tafel regions in view.
-    # Strategy: take the median log|i| of the passive plateau (if fitted)
-    # and add 3 decades upward. Fall back to p75+2 for simple curves.
+    # Y-axis limits
+    # y_lo: full cathodic arm (data minimum minus padding)
+    # y_hi: must show the active peak AND the passive plateau.
+    #   The active peak log|i| ≈ logIc + 2.303*(Epass-Ecorr)/ba.
+    #   We take the max of:
+    #     (a) active peak + 0.5 decades headroom
+    #     (b) 90th percentile of data + 0.5 (shows passive + onset of transpassive)
     fin  = log_obs[np.isfinite(log_obs)]
     y_lo = float(np.nanmin(fin)) - 0.2
     if ct in CT.PASS:
-        # Passive plateau level from fit + 3 decades = sensible ceiling
-        logIp = float(np.log10(max(float(best_p[6]), TINY)))
-        y_hi  = max(logIp + 3.0, float(np.percentile(fin, 75)) + 1.5)
+        Epass_4ylim = float(best_p[4])
+        # height of active peak on the anodic Tafel line
+        logI_peak = logIc + 2.303 * (Epass_4ylim - Ecorr) / ba
+        # 90th percentile captures passive plateau without extreme transpassive
+        y_hi = max(logI_peak + 0.5,
+                   float(np.percentile(fin, 90)) + 0.5)
     else:
-        y_hi = float(np.percentile(fin, 85)) + 1.5
+        y_hi = float(np.percentile(fin, 90)) + 1.0
 
     # Partial current Tafel lines
     logI_cat = np.log10(np.clip(icorr * np.exp(2.303*(Ecorr-E_dense)/bc), TINY, None))
