@@ -628,108 +628,132 @@ PLT_RC = {
 def make_figure(E, i_obs, best_p, ct, sample_name,
                 cat_res, an_res, Ecorr, show_regions=True, dpi=150):
     """
-    4-panel publication figure:
-      A (wide): Evans diagram — data, fit, region shading, Tafel tangents, markers
-      B:        Separate branch fits (cathodic / anodic)
-      C:        Linear i vs E
-      D:        Log-domain residuals
+    4-panel publication figure.
+    Panel A: Tafel/Evans diagram — X=E (V), Y=log10|i| — modern convention.
+             Tafel lines are the PARTIAL current curves, so they lie exactly
+             ON the polarisation curve in the linear Tafel regions.
+    Panel B: Branch fits (same axes).
+    Panel C: Linear i vs E.
+    Panel D: Residuals vs E.
     """
-    ba     = max(best_p[2], 1e-6)
-    bc     = max(best_p[3], 1e-6)
-    icorr  = best_p[1]
-    log_ic = np.log10(icorr + TINY)
+    ba    = max(float(best_p[2]), 1e-9)
+    bc    = max(float(best_p[3]), 1e-9)
+    icorr = float(best_p[1])
+    logIc = float(np.log10(max(icorr, TINY)))
 
     E_lo, E_hi = float(E.min()), float(E.max())
-    E_dense    = np.linspace(E_lo - 0.01, E_hi + 0.01, 5000)
-    i_dense    = pol_model(E_dense, best_p, ct)
-    i_fit_E    = pol_model(E, best_p, ct)
 
-    log_obs  = slog(i_obs)
-    log_den  = slog(i_dense)
-    log_fit  = slog(i_fit_E)
-    residuals = log_obs - log_fit
+    # Dense E grid
+    E_dense = np.linspace(E_lo, E_hi, 5000)
+    i_dense = pol_model(E_dense, best_p, ct)
+    i_fit_E = pol_model(E, best_p, ct)
 
-    r2v  = r2_score(log_obs, log_fit)
+    # Partial current Tafel lines (lie ON the curve in Tafel regions)
+    logI_ano   = np.log10(np.clip(icorr * np.exp(2.303*(E_dense-Ecorr)/ba), TINY, None))
+    logI_cat   = np.log10(np.clip(icorr * np.exp(2.303*(Ecorr-E_dense)/bc), TINY, None))
+    logI_total = slog(i_dense)
+
+    log_obs   = slog(i_obs)
+    log_fitE  = slog(i_fit_E)
+    residuals = log_obs - log_fitE
+
+    r2v  = r2_score(log_obs, log_fitE)
     rmse = float(np.sqrt(np.mean(residuals**2)))
+
+    # Y-axis limits from data percentiles
+    fin  = log_obs[np.isfinite(log_obs)]
+    y_lo = float(np.percentile(fin,  2)) - 0.4
+    y_hi = float(np.percentile(fin, 98)) + 0.4
+
+    # Clip curves to y window
+    in_y = lambda lv: (lv >= y_lo - 0.1) & (lv <= y_hi + 0.1)
+    msk_pol    = in_y(logI_total)
+    msk_ano    = in_y(logI_ano)
+    msk_cat    = in_y(logI_cat)
+    msk_ano_br = msk_ano & (E_dense >= Ecorr)   # anodic branch only
+    msk_cat_br = msk_cat & (E_dense <= Ecorr)   # cathodic branch only
 
     with plt.rc_context(PLT_RC):
         fig = plt.figure(figsize=(14, 10), dpi=dpi)
         gs  = GridSpec(2, 3, figure=fig,
-                       hspace=0.44, wspace=0.34,
-                       left=0.06, right=0.97, top=0.93, bottom=0.08)
-        ax_ev  = fig.add_subplot(gs[0, :])      # full width Evans diagram
-        ax_br  = fig.add_subplot(gs[1, 0])      # branch fits
-        ax_lin = fig.add_subplot(gs[1, 1])      # linear scale
-        ax_res = fig.add_subplot(gs[1, 2])      # residuals
+                       hspace=0.44, wspace=0.36,
+                       left=0.07, right=0.97, top=0.93, bottom=0.08)
+        ax_ev  = fig.add_subplot(gs[0, :])
+        ax_br  = fig.add_subplot(gs[1, 0])
+        ax_lin = fig.add_subplot(gs[1, 1])
+        ax_res = fig.add_subplot(gs[1, 2])
 
-        # ── Panel A: Evans Diagram ─────────────────────────────────────────
+        # ══ PANEL A — Tafel / Evans Diagram  (X=E, Y=log|i|) ════════════════
         ax = ax_ev
 
-        # Region shading (CORRECT boundaries from fitted params)
+        # Region shading — vertical bands (E ranges)
         if show_regions:
-            def shade(x0, x1, key, label):
+            def vband(e0, e1, key, lbl):
                 c, a = REGION_COLORS[key]
-                ax.axvspan(x0, x1, color=c, alpha=a, lw=0,
-                           label=label, zorder=1)
-
-            shade(E_lo, Ecorr, "cathodic", "Cathodic region")
+                e0c = float(np.clip(e0, E_lo, E_hi))
+                e1c = float(np.clip(e1, E_lo, E_hi))
+                if e1c > e0c:
+                    ax.axvspan(e0c, e1c, color=c, alpha=a, lw=0,
+                               label=lbl, zorder=1)
+            vband(E_lo, Ecorr, "cathodic", "Cathodic region")
             if ct in CT.SIMPLE:
-                shade(Ecorr, E_hi, "active", "Anodic (active)")
+                vband(Ecorr, E_hi, "active", "Anodic (active)")
             elif ct in CT.PASS:
-                Epass  = best_p[4]
-                Etrans = best_p[7] if ct in CT.TRANS else E_hi + 1
-                shade(Ecorr,            min(Epass, E_hi),  "active",       "Active dissolution")
-                shade(min(Epass, E_hi), min(Etrans, E_hi), "passive",      "Passive region")
-                if ct in CT.TRANS and Etrans <= E_hi:
-                    shade(min(Etrans, E_hi), E_hi, "transpassive", "Transpassive / pitting")
+                Ep = float(best_p[4])
+                Et = float(best_p[7]) if ct in CT.TRANS else E_hi + 1
+                vband(Ecorr, min(Ep, E_hi), "active", "Active dissolution")
+                vband(min(Ep, E_hi), min(Et, E_hi), "passive", "Passive region")
+                if ct in CT.TRANS and Et < E_hi:
+                    vband(Et, E_hi, "transpassive", "Transpassive / pitting")
 
         # Experimental data
-        ax.scatter(E, log_obs, s=14, color="#4a7fa8", alpha=0.60,
+        ax.scatter(E, log_obs, s=12, color="#4a7fa8", alpha=0.60,
                    zorder=2, label="Experimental data", linewidths=0)
 
-        # Fitted curve
-        ax.plot(E_dense, log_den, color="#1a3a5c", lw=2.4,
-                zorder=5, label=f"Global fit  (R²={r2v:.5f})")
+        # Fitted total polarisation curve
+        ax.plot(E_dense[msk_pol], logI_total[msk_pol],
+                color="#1a3a5c", lw=2.3, zorder=5,
+                label=f"Global fit  (R\u00b2={r2v:.5f})")
 
-        # Tafel tangent lines ±150 mV from Ecorr (clamped to data range)
-        dE = min(0.15, (E_hi - E_lo) * 0.20)
-        E_ta = np.linspace(Ecorr,        Ecorr + dE, 300)
-        E_tc = np.linspace(Ecorr - dE,   Ecorr,      300)
-        # log|i_a| = log(icorr) + (E-Ecorr)*2.303/ba
-        # log|i_c| = log(icorr) + (Ecorr-E)*2.303/bc
-        ax.plot(E_ta, log_ic + (E_ta - Ecorr) * 2.303 / ba,
-                "--", color="#e67e22", lw=1.8, zorder=4,
-                label=f"$\\beta_a$ = {ba*1000:.0f} mV dec$^{{-1}}$")
-        ax.plot(E_tc, log_ic + (Ecorr - E_tc) * 2.303 / bc,
-                "--", color="#8e44ad", lw=1.8, zorder=4,
-                label=f"$\\beta_c$ = {bc*1000:.0f} mV dec$^{{-1}}$")
+        # Tafel partial current lines — overlap the curve in Tafel regions
+        if msk_ano.any():
+            ax.plot(E_dense[msk_ano], logI_ano[msk_ano],
+                    "--", color="#e67e22", lw=2.0, zorder=4,
+                    label=f"\u03b2a = {ba*1000:.0f} mV/dec")
+        if msk_cat.any():
+            ax.plot(E_dense[msk_cat], logI_cat[msk_cat],
+                    "--", color="#8e44ad", lw=2.0, zorder=4,
+                    label=f"\u03b2c = {bc*1000:.0f} mV/dec")
 
-        # E_corr marker
-        ax.axvline(Ecorr, color="#e84393", ls="--", lw=1.5, zorder=3,
-                   label=f"$E_{{corr}}$ = {Ecorr:.4f} V")
+        # Crossing point + dotted drop-lines to axes
+        ax.plot(Ecorr, logIc, "x", color="#e84393", ms=12, mew=2.5, zorder=8)
+        ax.plot([Ecorr, Ecorr], [y_lo, logIc],
+                ":", color="#e84393", lw=1.2, alpha=0.85, zorder=3)
+        ax.plot([E_lo, Ecorr], [logIc, logIc],
+                ":", color="#e84393", lw=1.2, alpha=0.85, zorder=3)
 
-        # i_corr marker
-        ax.axhline(log_ic, color="#e84393", ls=":", lw=1.1, alpha=0.7, zorder=3)
-        y_lo = np.nanmin(log_obs[np.isfinite(log_obs)])
-        y_hi = np.nanmax(log_obs[np.isfinite(log_obs)])
-        ax.annotate(
-            f"$i_{{corr}}$ = {icorr:.2e} A cm$^{{-2}}$",
-            xy=(Ecorr, log_ic),
-            xytext=(E_lo + 0.05*(E_hi-E_lo), log_ic + max(0.3, (y_hi-y_lo)*0.07)),
-            fontsize=9, color="#c0392b", fontweight="bold",
-            arrowprops=dict(arrowstyle="-|>", color="#c0392b", lw=0.9),
-        )
+        # Labels at axes
+        ax.annotate(f"E\u1d9c\u1d52\u02b3\u02b3={Ecorr:.4f} V",
+                    xy=(Ecorr, y_lo),
+                    xytext=(Ecorr + 0.01*(E_hi-E_lo), y_lo + 0.04*(y_hi-y_lo)),
+                    fontsize=8.5, color="#e84393", fontweight="bold", ha="left")
+        ax.annotate(f"i\u1d9c\u1d52\u02b3\u02b3={icorr:.2e} A/cm\u00b2",
+                    xy=(E_lo, logIc),
+                    xytext=(E_lo + 0.01*(E_hi-E_lo), logIc + 0.03*(y_hi-y_lo)),
+                    fontsize=8.5, color="#e84393", fontweight="bold")
 
-        # Passive current marker
+        # ipass line
         if ct in CT.PASS:
-            ip_val = best_p[6]
-            ax.axhline(np.log10(ip_val + TINY), color="#27ae60",
-                       ls=":", lw=1.1, alpha=0.7, zorder=3,
-                       label=f"$i_{{pass}}$ = {ip_val:.2e} A cm$^{{-2}}$")
+            ip_val = float(best_p[6])
+            ax.axhline(np.log10(max(ip_val, TINY)), color="#27ae60",
+                       ls=":", lw=1.1, alpha=0.75, zorder=3,
+                       label=f"i_pass={ip_val:.2e} A/cm\u00b2")
 
-        ax.set_xlabel("$E$ vs. Reference (V)", fontsize=10)
-        ax.set_ylabel("$\\log_{{10}}$ |$i$| (A cm$^{{-2}}$)", fontsize=10)
-        ax.set_title(f"Evans Diagram — {sample_name}",
+        ax.set_xlim(E_lo, E_hi)
+        ax.set_ylim(y_lo, y_hi)
+        ax.set_xlabel("E vs. Reference (V)", fontsize=10)
+        ax.set_ylabel("log\u2081\u2080 |i| (A cm\u207b\u00b2)", fontsize=10)
+        ax.set_title(f"Evans Diagram \u2014 {sample_name}",
                      fontsize=11, fontweight="bold", pad=6)
         ax.xaxis.set_minor_locator(AutoMinorLocator(5))
         ax.yaxis.set_minor_locator(AutoMinorLocator(5))
@@ -738,69 +762,76 @@ def make_figure(E, i_obs, best_p, ct, sample_name,
         ax.grid(True, which="minor", ls=":", alpha=0.18)
         ax.legend(loc="lower right", ncol=4, fontsize=7.5,
                   framealpha=0.95, edgecolor="#cccccc")
-
-        # Fit quality badge
         r2c = "#27ae60" if r2v > 0.99 else "#e67e22" if r2v > 0.95 else "#e84393"
         ax.text(0.01, 0.97,
-                f"R² = {r2v:.5f}   RMSE = {rmse:.4f} log-units   "
-                f"Model: {CT.name(ct)}",
+                f"R\u00b2={r2v:.5f}  RMSE={rmse:.4f}  Model: {CT.name(ct)}",
                 transform=ax.transAxes, fontsize=8.5,
                 color=r2c, fontweight="bold", va="top",
                 bbox=dict(fc="white", ec=r2c, alpha=0.88, pad=3,
                           boxstyle="round,pad=0.3"))
 
-        # ── Panel B: Branch fits ───────────────────────────────────────────
+        # ══ PANEL B — Branch fits  (X=E, Y=log|i|) ═══════════════════════════
         ax = ax_br
-        ax.scatter(E, log_obs, s=5, color="#aab4c4", alpha=0.35,
-                   zorder=1, label="_", linewidths=0)
+        ax.scatter(E, log_obs, s=5, color="#aab4c4",
+                   alpha=0.28, zorder=1, linewidths=0)
 
-        # Cathodic branch data + Tafel tangent
         if "E_cat" in cat_res:
             ax.scatter(cat_res["E_cat"], cat_res["lgi_cat"],
-                       s=16, color="#6baed6", alpha=0.75, zorder=3,
+                       s=18, color="#6baed6", alpha=0.80, zorder=3,
                        label="Cathodic data", linewidths=0)
-            Elin = np.linspace(Ecorr - 0.55, Ecorr - 0.005, 200)
-            ax.plot(Elin, log_ic + (Ecorr - Elin) * 2.303 / bc,
-                    "--", color="#6baed6", lw=1.8, zorder=4,
-                    label=f"bc={bc*1000:.0f} mV/dec")
-        # Anodic branch data + Tafel tangent
+            if msk_cat_br.any():
+                ax.plot(E_dense[msk_cat_br], logI_cat[msk_cat_br],
+                        "--", color="#3182bd", lw=1.8, zorder=4,
+                        label=f"\u03b2c={bc*1000:.0f} mV/dec")
+
         if "E_an" in an_res:
             ax.scatter(an_res["E_an"], an_res["lgi_an"],
-                       s=16, color="#fd8d3c", alpha=0.75, zorder=3,
+                       s=18, color="#fd8d3c", alpha=0.80, zorder=3,
                        label="Anodic data", linewidths=0)
-            Ea_end = an_res.get("Epass", Ecorr + 0.3)
-            if Ea_end is None: Ea_end = Ecorr + 0.3
-            Elin = np.linspace(Ecorr + 0.005, min(float(Ea_end), E_hi), 200)
-            ax.plot(Elin, log_ic + (Elin - Ecorr) * 2.303 / ba,
-                    "--", color="#fd8d3c", lw=1.8, zorder=4,
-                    label=f"ba={ba*1000:.0f} mV/dec")
+            if msk_ano_br.any():
+                ax.plot(E_dense[msk_ano_br], logI_ano[msk_ano_br],
+                        "--", color="#e6550d", lw=1.8, zorder=4,
+                        label=f"\u03b2a={ba*1000:.0f} mV/dec")
             if an_res["has_passive"] and an_res["Epass"] is not None:
-                ax.axvline(an_res["Epass"], color="#27ae60", ls="-.", lw=1.0,
-                           alpha=0.85, label=f"E_pass={an_res['Epass']:.3f}V")
+                ax.axvline(float(an_res["Epass"]), color="#27ae60",
+                           ls="-.", lw=1.0, alpha=0.85,
+                           label=f"E_pass={an_res['Epass']:.3f}V")
 
         ax.axvline(Ecorr, color="#e84393", ls="--", lw=1.2, zorder=3)
-        ax.axhline(log_ic, color="#e84393", ls=":", lw=1.0, alpha=0.7)
-        ax.set_xlabel("$E$ (V)", fontsize=9)
-        ax.set_ylabel("$\\log_{{10}}$ |$i$|", fontsize=9)
-        ax.set_title("Branch Fits (Stage 2–3)", fontsize=10)
+        ax.axhline(logIc, color="#e84393", ls=":",  lw=1.0, alpha=0.7)
+        ax.set_xlim(E_lo, E_hi)
+        ax.set_ylim(y_lo, y_hi)
+        ax.set_xlabel("E (V)", fontsize=9)
+        ax.set_ylabel("log\u2081\u2080 |i|", fontsize=9)
+        ax.set_title("Branch Fits (Stage 2\u20133)", fontsize=10)
         ax.tick_params(which="both", top=True, right=True)
         ax.xaxis.set_minor_locator(AutoMinorLocator(5))
         ax.yaxis.set_minor_locator(AutoMinorLocator(5))
         ax.grid(True, which="major", ls="--", alpha=0.4)
-        ax.legend(fontsize=7.5)
+        ax.legend(fontsize=7.5, loc="upper right")
 
-        # ── Panel C: Linear scale ──────────────────────────────────────────
+        # ══ PANEL C — Linear i vs E ═══════════════════════════════════════════
         ax = ax_lin
-        i_scale = np.clip(i_dense, -10*np.max(np.abs(i_obs)),
-                                    10*np.max(np.abs(i_obs)))
-        ax.scatter(E, i_obs * 1e3, s=9, color="#4a7fa8",
-                   alpha=0.60, zorder=2, label="Data", linewidths=0)
-        ax.plot(E_dense, i_scale * 1e3, color="#1a3a5c", lw=2.0,
+        i_p95 = float(np.percentile(np.abs(i_obs), 95))
+        if i_p95 < 1e-6:
+            uscale, ulbl = 1e9,  "nA/cm\u00b2"
+        elif i_p95 < 1e-3:
+            uscale, ulbl = 1e6,  "\u03bcA/cm\u00b2"
+        else:
+            uscale, ulbl = 1e3,  "mA/cm\u00b2"
+        ylim_lin = i_p95 * uscale * 1.20
+        i_fit_cl = np.clip(i_dense * uscale, -ylim_lin * 3, ylim_lin * 3)
+
+        ax.scatter(E, i_obs * uscale, s=9, color="#4a7fa8",
+                   alpha=0.65, zorder=2, label="Data", linewidths=0)
+        ax.plot(E_dense, i_fit_cl, color="#1a3a5c", lw=2.0,
                 zorder=5, label="Fit")
-        ax.axhline(0, color="#888", lw=0.7, zorder=1)
+        ax.axhline(0,     color="#888",    lw=0.7, zorder=1)
         ax.axvline(Ecorr, color="#e84393", ls="--", lw=1.2, zorder=3)
-        ax.set_xlabel("$E$ (V)", fontsize=9)
-        ax.set_ylabel("$i$ (mA cm$^{-2}$)", fontsize=9)
+        ax.set_xlim(E_lo, E_hi)
+        ax.set_ylim(-ylim_lin, ylim_lin)
+        ax.set_xlabel("E (V)", fontsize=9)
+        ax.set_ylabel(f"i ({ulbl})", fontsize=9)
         ax.set_title("Linear Scale", fontsize=10)
         ax.tick_params(which="both", top=True, right=True)
         ax.xaxis.set_minor_locator(AutoMinorLocator(5))
@@ -808,18 +839,19 @@ def make_figure(E, i_obs, best_p, ct, sample_name,
         ax.grid(True, which="major", ls="--", alpha=0.4)
         ax.legend(fontsize=8)
 
-        # ── Panel D: Residuals ─────────────────────────────────────────────
+        # ══ PANEL D — Residuals ════════════════════════════════════════════════
         ax = ax_res
         ax.scatter(E, residuals, s=10, color="#2e86de",
                    alpha=0.65, zorder=3, linewidths=0)
-        ax.axhline(0,    color="#333", lw=0.9, zorder=2)
+        ax.axhline(0,    color="#333",    lw=0.9, zorder=2)
         ax.axhline( 0.1, color="#e84393", ls=":", lw=1.0, alpha=0.7)
         ax.axhline(-0.1, color="#e84393", ls=":", lw=1.0, alpha=0.7,
-                   label="±0.1 log-unit")
+                   label="\u00b10.1 log")
         ax.axvline(Ecorr, color="#e84393", ls="--", lw=0.9, alpha=0.6)
-        ax.set_xlabel("$E$ (V)", fontsize=9)
-        ax.set_ylabel("$\\Delta\\log_{{10}}$ |$i$|", fontsize=9)
-        ax.set_title(f"Residuals   R²={r2v:.5f}", fontsize=10)
+        ax.set_xlim(E_lo, E_hi)
+        ax.set_xlabel("E (V)", fontsize=9)
+        ax.set_ylabel("\u0394 log\u2081\u2080 |i|", fontsize=9)
+        ax.set_title(f"Residuals   R\u00b2={r2v:.5f}", fontsize=10)
         ax.tick_params(which="both", top=True, right=True)
         ax.xaxis.set_minor_locator(AutoMinorLocator(5))
         ax.yaxis.set_minor_locator(AutoMinorLocator(5))
@@ -830,6 +862,10 @@ def make_figure(E, i_obs, best_p, ct, sample_name,
                      fontweight="bold", color="#1a3a5c", y=0.98)
 
     return fig, r2v, rmse
+
+
+
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # EXPORT
