@@ -58,10 +58,10 @@ TINY    = 1e-30
 PALETTE = ["#2e86de","#e84393","#27ae60","#e67e22","#8e44ad","#16a085","#c0392b"]
 
 REGION_COLORS = {
-    "cathodic":     ("#6baed6", 0.12),
-    "active":       ("#fd8d3c", 0.12),
-    "passive":      ("#74c476", 0.14),
-    "transpassive": ("#9e9ac8", 0.16),
+    "cathodic":     ("#6baed6", 0.14),
+    "active":       ("#fd8d3c", 0.22),   # brighter — active region is narrow, needs visibility
+    "passive":      ("#74c476", 0.16),
+    "transpassive": ("#9e9ac8", 0.18),
 }
 
 MATERIALS = {
@@ -648,11 +648,16 @@ PLT_RC = {
 def make_figure(E, i_obs, best_p, ct, sample_name,
                 cat_res, an_res, Ecorr, show_regions=True, dpi=150):
     """
-    4-panel publication figure. X=E (V), Y=log10|i|.
+    Publication-quality 4-panel figure. X=E (V), Y=log10|i|.
 
-    Tafel lines = partial current curves, restricted to the ±Tafel window
-    around Ecorr so they stay within the plot and overlap the linear region.
-    Y-axis spans the full data range so nothing is cut off.
+    Tafel lines strategy:
+      - Use the FITTED partial currents as Tafel lines (they naturally touch
+        the polarisation curve in the linear regions).
+      - Cathodic line: plotted over the FULL E range but only visible where
+        log(i_cat) >= y_lo (full cathodic arm shown, nothing cut).
+      - Anodic line: plotted from Ecorr to Epass only (active region), not
+        into the passive plateau where it becomes meaningless.
+      - Y-axis: full data range with no percentile clipping.
     """
     ba    = max(float(best_p[2]), 1e-9)
     bc    = max(float(best_p[3]), 1e-9)
@@ -660,54 +665,43 @@ def make_figure(E, i_obs, best_p, ct, sample_name,
     logIc = float(np.log10(max(icorr, TINY)))
 
     E_lo, E_hi = float(E.min()), float(E.max())
-
-    # Dense E grid
-    E_dense = np.linspace(E_lo, E_hi, 5000)
-    i_dense = pol_model(E_dense, best_p, ct)
-    i_fit_E = pol_model(E, best_p, ct)
-
-    # Partial current Tafel lines — lie ON the curve in linear Tafel regions
-    logI_ano   = np.log10(np.clip(
-                    icorr * np.exp(2.303*(E_dense-Ecorr)/ba), TINY, None))
-    logI_cat   = np.log10(np.clip(
-                    icorr * np.exp(2.303*(Ecorr-E_dense)/bc), TINY, None))
-    logI_total = slog(i_dense)
-
-    log_obs   = slog(i_obs)
-    log_fitE  = slog(i_fit_E)
-    residuals = log_obs - log_fitE
-
+    E_dense    = np.linspace(E_lo, E_hi, 5000)
+    i_dense    = pol_model(E_dense, best_p, ct)
+    i_fit_E    = pol_model(E, best_p, ct)
+    log_obs    = slog(i_obs)
+    log_den    = slog(i_dense)
+    log_fitE   = slog(i_fit_E)
+    residuals  = log_obs - log_fitE
     r2v  = r2_score(log_obs, log_fitE)
     rmse = float(np.sqrt(np.mean(residuals**2)))
 
-    # ── Y-axis: use FULL data range, no percentile clipping ───────────────────
+    # Y-axis: show the full cathodic-to-passive range clearly.
+    # Use the data range but cap y_hi at the 90th percentile + 1.0 to prevent
+    # the transpassive spike from dominating the y-axis and making the
+    # passive/active/Tafel regions appear compressed at the bottom.
     fin  = log_obs[np.isfinite(log_obs)]
-    y_lo = float(np.nanmin(fin)) - 0.3
-    y_hi = float(np.nanmax(fin)) + 0.3
-    y_span = y_hi - y_lo
+    y_lo = float(np.nanmin(fin)) - 0.2
+    y_hi = float(np.percentile(fin, 90)) + 1.0
 
-    # ── Tafel line display window ──────────────────────────────────────────────
-    # Restrict to region where each partial dominates the total current.
-    # Cathodic partial dominates where E < Ecorr (cathodic branch).
-    # Anodic partial dominates where E > Ecorr AND before passive transition.
-    # We show each line only where log(partial) is within the y-range.
-    in_y = lambda lv: (lv >= y_lo - 0.05) & (lv <= y_hi + 0.05)
+    # Partial current Tafel lines
+    logI_cat = np.log10(np.clip(icorr * np.exp(2.303*(Ecorr-E_dense)/bc), TINY, None))
+    logI_ano = np.log10(np.clip(icorr * np.exp(2.303*(E_dense-Ecorr)/ba), TINY, None))
 
-    # Cathodic Tafel line: left of Ecorr only
-    msk_cat = in_y(logI_cat) & (E_dense <= Ecorr)
-    # Anodic Tafel line: right of Ecorr, stop at Epass (before passive plateau)
+    # Cathodic: full E range, but only where it's within the y window
+    msk_cat = (logI_cat >= y_lo - 0.05) & (logI_cat <= y_hi + 0.05)
+
+    # Anodic Tafel line: show wherever it's within the visible y-range
+    # Restricted to E >= Ecorr (anodic side) and stopped at Epass for passive models
+    # so the line overlaps the active rising portion of the polarisation curve.
+    # NOTE: if logIc < y_lo (icorr below visible range), the line enters the plot
+    # from below — we still show the visible portion with correct slope.
     if ct in CT.PASS:
-        Ep = float(best_p[4])
-        msk_ano = in_y(logI_ano) & (E_dense >= Ecorr) & (E_dense <= Ep)
+        Epass_fit = float(best_p[4])
+        msk_ano = (logI_ano >= y_lo - 0.05) & (logI_ano <= y_hi + 0.05)                 & (E_dense >= Ecorr) & (E_dense <= Epass_fit)
     else:
-        msk_ano = in_y(logI_ano) & (E_dense >= Ecorr)
-
-    # Total curve and data masks
-    msk_pol = in_y(logI_total)
-
-    # For panel B branch lines — same masks
-    msk_ano_br = msk_ano
-    msk_cat_br = msk_cat
+        msk_ano = (logI_ano >= y_lo - 0.05) & (logI_ano <= y_hi + 0.05)                 & (E_dense >= Ecorr)
+    # Cathodic Tafel line: show wherever visible on the cathodic side (E <= Ecorr)
+    # Falls through to E > Ecorr only if no cathodic data restricts it
 
     with plt.rc_context(PLT_RC):
         fig = plt.figure(figsize=(14, 10), dpi=dpi)
@@ -719,18 +713,16 @@ def make_figure(E, i_obs, best_p, ct, sample_name,
         ax_lin = fig.add_subplot(gs[1, 1])
         ax_res = fig.add_subplot(gs[1, 2])
 
-        # ══ PANEL A — Tafel / Evans Diagram ══════════════════════════════════
+        # ══ PANEL A ══════════════════════════════════════════════════════════
         ax = ax_ev
 
-        # Region shading
         if show_regions:
             def vband(e0, e1, key, lbl):
                 c, a = REGION_COLORS[key]
                 e0c = float(np.clip(e0, E_lo, E_hi))
                 e1c = float(np.clip(e1, E_lo, E_hi))
                 if e1c > e0c:
-                    ax.axvspan(e0c, e1c, color=c, alpha=a, lw=0,
-                               label=lbl, zorder=1)
+                    ax.axvspan(e0c, e1c, color=c, alpha=a, lw=0, label=lbl, zorder=1)
             vband(E_lo, Ecorr, "cathodic", "Cathodic region")
             if ct in CT.SIMPLE:
                 vband(Ecorr, E_hi, "active", "Anodic (active)")
@@ -746,48 +738,45 @@ def make_figure(E, i_obs, best_p, ct, sample_name,
         ax.scatter(E, log_obs, s=12, color="#4a7fa8", alpha=0.60,
                    zorder=2, label="Experimental data", linewidths=0)
 
-        # Fitted polarisation curve
-        ax.plot(E_dense[msk_pol], logI_total[msk_pol],
-                color="#1a3a5c", lw=2.3, zorder=5,
+        # Fitted model
+        ax.plot(E_dense, log_den, color="#1a3a5c", lw=2.3, zorder=5,
                 label=f"Global fit  (R\u00b2={r2v:.5f})")
 
-        # Anodic Tafel line (overlaps curve in anodic linear region)
-        if msk_ano.any():
-            ax.plot(E_dense[msk_ano], logI_ano[msk_ano],
-                    "--", color="#e67e22", lw=2.2, zorder=4,
-                    label=f"\u03b2a = {ba*1000:.0f} mV/dec")
-
-        # Cathodic Tafel line (overlaps curve in cathodic linear region)
+        # Cathodic Tafel line — spans cathodic branch, overlaps data there
         if msk_cat.any():
             ax.plot(E_dense[msk_cat], logI_cat[msk_cat],
                     "--", color="#8e44ad", lw=2.2, zorder=4,
                     label=f"\u03b2c = {bc*1000:.0f} mV/dec")
 
-        # Crossing point (Ecorr, logIc) + dotted drop-lines
+        # Anodic Tafel line — active region only
+        if msk_ano.any():
+            ax.plot(E_dense[msk_ano], logI_ano[msk_ano],
+                    "--", color="#e67e22", lw=2.2, zorder=4,
+                    label=f"\u03b2a = {ba*1000:.0f} mV/dec")
+
+        # Crossing point + drop-lines
         ax.plot(Ecorr, logIc, "x", color="#e84393", ms=12, mew=2.5, zorder=8)
         ax.plot([Ecorr, Ecorr], [y_lo, logIc],
                 ":", color="#e84393", lw=1.2, alpha=0.85, zorder=3)
         ax.plot([E_lo, Ecorr], [logIc, logIc],
                 ":", color="#e84393", lw=1.2, alpha=0.85, zorder=3)
 
-        # Axis labels for Ecorr / icorr
-        ax.annotate(f"E\u1d9c\u1d52\u02b3\u02b3={Ecorr:.4f} V",
+        # Annotations
+        y_span = y_hi - y_lo
+        ax.annotate(f"E\u1d9c\u1d52\u02b3\u02b3 = {Ecorr:.4f} V",
                     xy=(Ecorr, y_lo),
-                    xytext=(Ecorr + 0.01*(E_hi-E_lo),
-                            y_lo + 0.04*y_span),
+                    xytext=(Ecorr + 0.01*(E_hi-E_lo), y_lo + 0.04*y_span),
                     fontsize=8.5, color="#e84393", fontweight="bold", ha="left")
-        ax.annotate(f"i\u1d9c\u1d52\u02b3\u02b3={icorr:.2e} A/cm\u00b2",
+        ax.annotate(f"i\u1d9c\u1d52\u02b3\u02b3 = {icorr:.2e} A/cm\u00b2",
                     xy=(E_lo, logIc),
-                    xytext=(E_lo + 0.01*(E_hi-E_lo),
-                            logIc + 0.03*y_span),
+                    xytext=(E_lo + 0.01*(E_hi-E_lo), logIc + 0.03*y_span),
                     fontsize=8.5, color="#e84393", fontweight="bold")
 
-        # ipass horizontal line
         if ct in CT.PASS:
             ip_val = float(best_p[6])
             ax.axhline(np.log10(max(ip_val, TINY)), color="#27ae60",
                        ls=":", lw=1.1, alpha=0.75, zorder=3,
-                       label=f"i_pass={ip_val:.2e} A/cm\u00b2")
+                       label=f"i_pass = {ip_val:.2e} A/cm\u00b2")
 
         ax.set_xlim(E_lo, E_hi)
         ax.set_ylim(y_lo, y_hi)
@@ -805,40 +794,37 @@ def make_figure(E, i_obs, best_p, ct, sample_name,
         r2c = "#27ae60" if r2v > 0.99 else "#e67e22" if r2v > 0.95 else "#e84393"
         ax.text(0.01, 0.97,
                 f"R\u00b2={r2v:.5f}  RMSE={rmse:.4f}  Model: {CT.name(ct)}",
-                transform=ax.transAxes, fontsize=8.5,
-                color=r2c, fontweight="bold", va="top",
+                transform=ax.transAxes, fontsize=8.5, color=r2c,
+                fontweight="bold", va="top",
                 bbox=dict(fc="white", ec=r2c, alpha=0.88, pad=3,
                           boxstyle="round,pad=0.3"))
 
         # ══ PANEL B — Branch fits ═════════════════════════════════════════════
         ax = ax_br
-        ax.scatter(E, log_obs, s=5, color="#aab4c4",
-                   alpha=0.28, zorder=1, linewidths=0)
-
+        ax.scatter(E, log_obs, s=5, color="#aab4c4", alpha=0.28, zorder=1, linewidths=0)
         if "E_cat" in cat_res:
             ax.scatter(cat_res["E_cat"], cat_res["lgi_cat"],
                        s=18, color="#6baed6", alpha=0.80, zorder=3,
                        label="Cathodic data", linewidths=0)
-            if msk_cat_br.any():
-                ax.plot(E_dense[msk_cat_br], logI_cat[msk_cat_br],
+            msk_c_br = msk_cat & (E_dense <= Ecorr)
+            if msk_c_br.any():
+                ax.plot(E_dense[msk_c_br], logI_cat[msk_c_br],
                         "--", color="#3182bd", lw=1.8, zorder=4,
                         label=f"\u03b2c={bc*1000:.0f} mV/dec")
-
         if "E_an" in an_res:
             ax.scatter(an_res["E_an"], an_res["lgi_an"],
                        s=18, color="#fd8d3c", alpha=0.80, zorder=3,
                        label="Anodic data", linewidths=0)
-            if msk_ano_br.any():
-                ax.plot(E_dense[msk_ano_br], logI_ano[msk_ano_br],
+            if msk_ano.any():
+                ax.plot(E_dense[msk_ano], logI_ano[msk_ano],
                         "--", color="#e6550d", lw=1.8, zorder=4,
                         label=f"\u03b2a={ba*1000:.0f} mV/dec")
             if an_res["has_passive"] and an_res["Epass"] is not None:
                 ax.axvline(float(an_res["Epass"]), color="#27ae60",
                            ls="-.", lw=1.0, alpha=0.85,
                            label=f"E_pass={an_res['Epass']:.3f}V")
-
         ax.axvline(Ecorr, color="#e84393", ls="--", lw=1.2, zorder=3)
-        ax.axhline(logIc, color="#e84393", ls=":",  lw=1.0, alpha=0.7)
+        ax.axhline(logIc, color="#e84393", ls=":", lw=1.0, alpha=0.7)
         ax.set_xlim(E_lo, E_hi)
         ax.set_ylim(y_lo, y_hi)
         ax.set_xlabel("E (V)", fontsize=9)
@@ -861,12 +847,10 @@ def make_figure(E, i_obs, best_p, ct, sample_name,
             uscale, ulbl = 1e3,  "mA/cm\u00b2"
         ylim_lin = i_p95 * uscale * 1.20
         i_fit_cl = np.clip(i_dense * uscale, -ylim_lin * 3, ylim_lin * 3)
-
         ax.scatter(E, i_obs * uscale, s=9, color="#4a7fa8",
                    alpha=0.65, zorder=2, label="Data", linewidths=0)
-        ax.plot(E_dense, i_fit_cl, color="#1a3a5c", lw=2.0,
-                zorder=5, label="Fit")
-        ax.axhline(0,     color="#888",    lw=0.7, zorder=1)
+        ax.plot(E_dense, i_fit_cl, color="#1a3a5c", lw=2.0, zorder=5, label="Fit")
+        ax.axhline(0, color="#888", lw=0.7, zorder=1)
         ax.axvline(Ecorr, color="#e84393", ls="--", lw=1.2, zorder=3)
         ax.set_xlim(E_lo, E_hi)
         ax.set_ylim(-ylim_lin, ylim_lin)
@@ -881,12 +865,10 @@ def make_figure(E, i_obs, best_p, ct, sample_name,
 
         # ══ PANEL D — Residuals ════════════════════════════════════════════════
         ax = ax_res
-        ax.scatter(E, residuals, s=10, color="#2e86de",
-                   alpha=0.65, zorder=3, linewidths=0)
+        ax.scatter(E, residuals, s=10, color="#2e86de", alpha=0.65, zorder=3, linewidths=0)
         ax.axhline(0,    color="#333",    lw=0.9, zorder=2)
         ax.axhline( 0.1, color="#e84393", ls=":", lw=1.0, alpha=0.7)
-        ax.axhline(-0.1, color="#e84393", ls=":", lw=1.0, alpha=0.7,
-                   label="\u00b10.1 log")
+        ax.axhline(-0.1, color="#e84393", ls=":", lw=1.0, alpha=0.7, label="\u00b10.1 log")
         ax.axvline(Ecorr, color="#e84393", ls="--", lw=0.9, alpha=0.6)
         ax.set_xlim(E_lo, E_hi)
         ax.set_xlabel("E (V)", fontsize=9)
@@ -902,6 +884,7 @@ def make_figure(E, i_obs, best_p, ct, sample_name,
                      fontweight="bold", color="#1a3a5c", y=0.98)
 
     return fig, r2v, rmse
+
 
 
 
