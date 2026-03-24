@@ -442,15 +442,14 @@ def _build_bounds(Ecorr, cat, an, ct, E_min, E_max, E_span):
     ic   = max(cat["icorr"], 1e-14)
     iL   = max(cat["iL"],    1e-10)
 
-    # Use branch-fit Tafel slopes to set TIGHT bounds:
-    # Allow ±60% around the branch-fit value, clamped to physical range.
-    # This prevents the optimizer from assigning passive/transpassive slopes to ba/bc.
+    # Tafel slope bounds: ±3× around branch-fit, clamped to physical range.
+    # Wide enough for DE to find the true minimum even if branch fit is off.
     ba_fit = float(an["ba"])
     bc_fit = float(cat["bc"])
-    ba_lo  = max(ba_fit * 0.40, 0.010)
-    ba_hi  = min(ba_fit * 2.50, 0.250)
-    bc_lo  = max(bc_fit * 0.40, 0.010)
-    bc_hi  = min(bc_fit * 2.50, 0.350)
+    ba_lo  = max(ba_fit * 0.30, 0.010)
+    ba_hi  = min(ba_fit * 3.00, 0.250)
+    bc_lo  = max(bc_fit * 0.30, 0.010)
+    bc_hi  = min(bc_fit * 3.00, 0.400)
 
     lo = np.array([
         E_min,                  # Ecorr
@@ -504,24 +503,21 @@ def _pbounds(lo, hi, fidx):
 
 def global_polish(E, i, p0, ct, lo, hi):
     """
-    Three-stage optimization with Tafel-region weighting.
-    Points within ±150 mV of Ecorr get 10× higher weight so ba and bc are
-    fitted to the actual linear Tafel slopes, not the passive/transpassive
-    regions which dominate in terms of point count.
+    5-stage optimization (DE → L-BFGS-B → Nelder-Mead → Powell → SLSQP).
+    Inspired by batch_tafel.py approach.
+
+    Weighting: 8× weight within ±150 mV of Ecorr (Tafel region) so ba, bc,
+    icorr are anchored to the linear slopes, not the passive plateau which
+    has many more data points.
     """
     ld    = slog(i)
     fidx  = CT.idx(ct)
     bnds  = _pbounds(lo, hi, fidx)
     n, nf = len(E), len(fidx)
 
-    # Two-zone weighting:
-    #   Tafel zone (±200 mV of Ecorr_p0): weight 8 — fits ba, bc, icorr
-    #   Outside Tafel zone: weight 1 — fits passive/transpassive shape
-    # This prevents the large passive+transpassive dataset from overriding
-    # the true Tafel slopes which appear only near Ecorr.
+    # Tafel-zone weighting: strong weight near Ecorr
     Ecorr_p0 = float(p0[0])
-    dE_p0    = np.abs(E - Ecorr_p0)
-    w_base   = 1.0 + 7.0 * np.exp(-dE_p0 / 0.120)
+    w_base   = 1.0 + 7.0 * np.exp(-np.abs(E - Ecorr_p0) / 0.120)
     w_base   = w_base / w_base.mean()
 
     def obj(x):
@@ -541,37 +537,54 @@ def global_polish(E, i, p0, ct, lo, hi):
         if v < best_val:
             best_x, best_val = x.copy(), v
 
-    # 1. DE
+    # Stage 1: DE — aggressive global search
     try:
-        ps  = max(12, min(20, nf * 3))
-        mi  = max(200, min(600, nf * 50))
+        ps  = max(15, min(20, nf * 3))
+        mi  = max(300, min(800, nf * 60))
         res = differential_evolution(obj, bnds, seed=42, maxiter=mi, popsize=ps,
-                                     tol=1e-12, mutation=(0.5, 1.7),
-                                     recombination=0.85, polish=False, workers=1)
+                                     tol=1e-14, mutation=(0.5, 1.9),
+                                     recombination=0.9, polish=False, workers=1,
+                                     strategy="best1bin")
         update(res.x)
     except:
         pass
 
-    # 2. L-BFGS-B
+    # Stage 2: L-BFGS-B
     try:
         r = minimize(obj, best_x, method="L-BFGS-B", bounds=bnds,
-                     options={"maxiter": 20000, "ftol": 1e-15, "gtol": 1e-12})
+                     options={"maxiter": 30000, "ftol": 1e-16, "gtol": 1e-14})
         update(r.x)
     except:
         pass
 
-    # 3. Nelder-Mead
+    # Stage 3: Nelder-Mead
     try:
         r = minimize(obj, best_x, method="Nelder-Mead",
-                     options={"maxiter": 20000, "xatol": 1e-12, "fatol": 1e-14,
-                              "adaptive": True})
+                     options={"maxiter": 20000, "xatol": 1e-14,
+                              "fatol": 1e-16, "adaptive": True})
+        update(r.x)
+    except:
+        pass
+
+    # Stage 4: Powell — pattern search (good at escaping flat regions)
+    try:
+        r = minimize(obj, best_x, method="Powell",
+                     options={"maxiter": 15000, "xtol": 1e-14, "ftol": 1e-16})
+        update(r.x)
+    except:
+        pass
+
+    # Stage 5: SLSQP — final constrained polish
+    try:
+        r = minimize(obj, best_x, method="SLSQP", bounds=bnds,
+                     options={"maxiter": 10000, "ftol": 1e-16})
         update(r.x)
     except:
         pass
 
     best_p = _unpack(best_x, fidx, p0.copy(), lo, hi)
 
-    # Goodness of fit
+    # Unweighted goodness of fit (for reporting)
     pred  = pol_model(E, best_p, ct)
     log_p = slog(pred)
     sse   = float(np.sum((ld - log_p) ** 2))
@@ -659,6 +672,10 @@ def make_figure(E, i_obs, best_p, ct, sample_name,
         into the passive plateau where it becomes meaningless.
       - Y-axis: full data range with no percentile clipping.
     """
+    # Always use the FITTED Ecorr (best_p[0]) for Tafel line anchoring.
+    # The `Ecorr` argument (from detect_ecorr) is only used as a fallback label.
+    Ecorr = float(best_p[0])   # override with fitted value
+
     ba    = max(float(best_p[2]), 1e-9)
     bc    = max(float(best_p[3]), 1e-9)
     icorr = float(best_p[1])
@@ -675,13 +692,18 @@ def make_figure(E, i_obs, best_p, ct, sample_name,
     r2v  = r2_score(log_obs, log_fitE)
     rmse = float(np.sqrt(np.mean(residuals**2)))
 
-    # Y-axis: show the full cathodic-to-passive range clearly.
-    # Use the data range but cap y_hi at the 90th percentile + 1.0 to prevent
-    # the transpassive spike from dominating the y-axis and making the
-    # passive/active/Tafel regions appear compressed at the bottom.
+    # Y-axis limits: show full cathodic arm (y_lo = data minimum),
+    # cap y_hi to keep active/passive/Tafel regions in view.
+    # Strategy: take the median log|i| of the passive plateau (if fitted)
+    # and add 3 decades upward. Fall back to p75+2 for simple curves.
     fin  = log_obs[np.isfinite(log_obs)]
     y_lo = float(np.nanmin(fin)) - 0.2
-    y_hi = float(np.percentile(fin, 90)) + 1.0
+    if ct in CT.PASS:
+        # Passive plateau level from fit + 3 decades = sensible ceiling
+        logIp = float(np.log10(max(float(best_p[6]), TINY)))
+        y_hi  = max(logIp + 3.0, float(np.percentile(fin, 75)) + 1.5)
+    else:
+        y_hi = float(np.percentile(fin, 85)) + 1.5
 
     # Partial current Tafel lines
     logI_cat = np.log10(np.clip(icorr * np.exp(2.303*(Ecorr-E_dense)/bc), TINY, None))
@@ -745,13 +767,13 @@ def make_figure(E, i_obs, best_p, ct, sample_name,
         # Cathodic Tafel line — spans cathodic branch, overlaps data there
         if msk_cat.any():
             ax.plot(E_dense[msk_cat], logI_cat[msk_cat],
-                    "--", color="#8e44ad", lw=2.2, zorder=4,
+                    "--", color="#8e44ad", lw=2.5, zorder=6,
                     label=f"\u03b2c = {bc*1000:.0f} mV/dec")
 
         # Anodic Tafel line — active region only
         if msk_ano.any():
             ax.plot(E_dense[msk_ano], logI_ano[msk_ano],
-                    "--", color="#e67e22", lw=2.2, zorder=4,
+                    "--", color="#e67e22", lw=2.5, zorder=6,
                     label=f"\u03b2a = {ba*1000:.0f} mV/dec")
 
         # Crossing point + drop-lines
@@ -1200,10 +1222,11 @@ with tab_fit:
                     # Stage 5 — Global optimisation
                     E_lo = float(E.min()); E_hi = float(E.max()); E_sp = E_hi - E_lo
 
+                    # Always try multiple models and pick by AICc (like batch script)
                     candidates = [ct_detected]
-                    if CT.A not in candidates:  candidates.append(CT.A)
-                    if an_res["has_passive"] and CT.PT not in candidates:
-                        candidates.append(CT.PT)
+                    if CT.A not in candidates:      candidates.append(CT.A)
+                    if CT.P not in candidates:      candidates.append(CT.P)   # always try passive
+                    if CT.PT not in candidates:     candidates.append(CT.PT)  # always try transpassive
                     if force_ct != "auto":
                         candidates = [force_ct]
 
