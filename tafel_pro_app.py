@@ -692,44 +692,52 @@ def make_figure(E, i_obs, best_p, ct, sample_name,
     r2v  = r2_score(log_obs, log_fitE)
     rmse = float(np.sqrt(np.mean(residuals**2)))
 
-    # Y-axis limits
-    # y_lo: full cathodic arm (data minimum minus padding)
-    # y_hi: must show the active peak AND the passive plateau.
-    #   The active peak log|i| ≈ logIc + 2.303*(Epass-Ecorr)/ba.
-    #   We take the max of:
-    #     (a) active peak + 0.5 decades headroom
-    #     (b) 90th percentile of data + 0.5 (shows passive + onset of transpassive)
+    # ── Y-axis limits ────────────────────────────────────────────────────────
+    # y_lo = full cathodic arm (data minimum, nothing cut)
+    # y_hi = anchored to the ACTIVE PEAK of the data, not the transpassive tail.
+    #   For passive models: find the max log|i| in the active region
+    #   (Ecorr → Epass), then add 1.5 decades headroom. This shows the
+    #   active peak, both Tafel lines, and the top of the passive plateau
+    #   without the transpassive blowup compressing everything.
     fin  = log_obs[np.isfinite(log_obs)]
     y_lo = float(np.nanmin(fin)) - 0.2
+
     if ct in CT.PASS:
-        Epass_4ylim = float(best_p[4])
-        # height of active peak on the anodic Tafel line
-        logI_peak = logIc + 2.303 * (Epass_4ylim - Ecorr) / ba
-        # 90th percentile captures passive plateau without extreme transpassive
-        y_hi = max(logI_peak + 0.5,
-                   float(np.percentile(fin, 90)) + 0.5)
+        Epass_4y = float(best_p[4])
+        # Max log|i| in the active region (data points only, not model)
+        act_mask = (E >= Ecorr - 0.02) & (E <= Epass_4y + 0.05)
+        if np.sum(act_mask) >= 2:
+            log_act = slog(i_obs[act_mask])
+            log_act = log_act[np.isfinite(log_act)]
+            active_peak_log = float(np.max(log_act)) if len(log_act) > 0 else logIc
+        else:
+            # Fall back: compute from fitted model
+            active_peak_log = logIc + 2.303 * (Epass_4y - Ecorr) / ba
+        # y_hi = active peak + 1.5 decades (shows peak + passive plateau clearly)
+        # Also ensure passive plateau is visible (logIp + 2 decades)
+        logIp_val = float(np.log10(max(float(best_p[6]), TINY)))
+        y_hi = max(active_peak_log + 1.5, logIp_val + 2.0)
     else:
         y_hi = float(np.percentile(fin, 90)) + 1.0
 
-    # Partial current Tafel lines
+    # ── Partial current Tafel lines ───────────────────────────────────────────
     logI_cat = np.log10(np.clip(icorr * np.exp(2.303*(Ecorr-E_dense)/bc), TINY, None))
     logI_ano = np.log10(np.clip(icorr * np.exp(2.303*(E_dense-Ecorr)/ba), TINY, None))
 
-    # Cathodic: full E range, but only where it's within the y window
-    msk_cat = (logI_cat >= y_lo - 0.05) & (logI_cat <= y_hi + 0.05)
+    # Cathodic: shown where within y-window, restricted to cathodic side
+    msk_cat = (logI_cat >= y_lo - 0.05) & (logI_cat <= y_hi + 0.05)             & (E_dense <= Ecorr + 0.005)
 
-    # Anodic Tafel line: show wherever it's within the visible y-range
-    # Restricted to E >= Ecorr (anodic side) and stopped at Epass for passive models
-    # so the line overlaps the active rising portion of the polarisation curve.
-    # NOTE: if logIc < y_lo (icorr below visible range), the line enters the plot
-    # from below — we still show the visible portion with correct slope.
+    # Anodic: shown where within y-window AND within ±1 decade of the
+    # fitted model curve (so the dashed line overlaps the actual curve).
+    # This prevents the Tafel extrapolation from shooting off-screen while
+    # still drawing the line through the actual linear Tafel region.
     if ct in CT.PASS:
         Epass_fit = float(best_p[4])
-        msk_ano = (logI_ano >= y_lo - 0.05) & (logI_ano <= y_hi + 0.05)                 & (E_dense >= Ecorr) & (E_dense <= Epass_fit)
+        msk_ano_E = (E_dense >= Ecorr) & (E_dense <= Epass_fit)
     else:
-        msk_ano = (logI_ano >= y_lo - 0.05) & (logI_ano <= y_hi + 0.05)                 & (E_dense >= Ecorr)
-    # Cathodic Tafel line: show wherever visible on the cathodic side (E <= Ecorr)
-    # Falls through to E > Ecorr only if no cathodic data restricts it
+        msk_ano_E = E_dense >= Ecorr
+    # Only draw where anodic partial is within y-window
+    msk_ano = msk_ano_E & (logI_ano >= y_lo - 0.05) & (logI_ano <= y_hi + 0.05)
 
     with plt.rc_context(PLT_RC):
         fig = plt.figure(figsize=(14, 10), dpi=dpi)
