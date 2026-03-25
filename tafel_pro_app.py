@@ -1,13 +1,13 @@
-# app.py
 """
 Polarization Curve Fitter — Publication-Grade Streamlit App
-(robust local Tafel overlays + Tafel intersection i_corr)
-=================================================================
+(Robust local Tafel overlays + Tafel intersection i_corr + adjustable detection)
+===============================================================================
 - Vectorized sliding-window regressions with curvature & diffusion guards
-- Huber refinement (IRLS) for the chosen Tafel windows
+- Huber refinement (IRLS) and Theil–Sen on the chosen Tafel windows
 - Local Tafel dashed lines drawn as straight segments (with optional faint extension)
 - i_corr annotated from Tafel intersection of local anodic/cathodic lines (toggleable)
 - Lean global optimization and adaptive plotting
+- Stable widget keys; force-model selection via session-backed key
 
 Run:
     streamlit run app.py
@@ -52,7 +52,7 @@ st.markdown("""
 </style>""", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONSTANTS
+# CONSTANTS & CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 TINY    = 1e-30
 PALETTE = ["#2e86de","#e84393","#27ae60","#e67e22","#8e44ad","#16a085","#c0392b"]
@@ -74,6 +74,20 @@ MATERIALS = {
     "Titanium":              (11.99, 4.51),
     "Zinc":                  (32.69, 7.14),
 }
+
+# Global detection settings (overridden by sidebar "Advanced")
+CFG = dict(
+    cath_guard=0.020,      # V — min distance of cathodic window from Ecorr
+    anod_guard=0.010,      # V — min distance of anodic window from Ecorr
+    curvature_max=40.0,    # max |d2 log|i| / dE^2| inside window
+    lin_frac=0.70,         # fraction of derivative signs consistent with slope
+    min_w_cat=4,           # minimum window length (cathodic)
+    min_w_ano=3,           # minimum window length (anodic)
+    # Tafel slope range (V/dec), ok if 1/|slope| is within these
+    beta_min=0.02,         # 20 mV/dec
+    beta_max_c=0.35,       # 350 mV/dec
+    beta_max_a=0.40        # 400 mV/dec
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPER MATH
@@ -215,7 +229,7 @@ def detect_ecorr(E, i):
     best = min(crossings, key=lambda x: x[0]); return best[0], best[1]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HUBER REFINEMENT (IRLS)
+# ROBUST LINE REFINEMENT
 # ─────────────────────────────────────────────────────────────────────────────
 def _huber_fit(x, y, slope, intercept, iters=3, c=1.345):
     for _ in range(iters):
@@ -233,6 +247,19 @@ def _huber_fit(x, y, slope, intercept, iters=3, c=1.345):
             break
     return slope, intercept
 
+def _theil_sen(x, y):
+    # Median-of-slopes estimator; O(m^2) but m≤~25 so OK
+    m = len(x)
+    if m < 2:
+        return 0.0, float(np.median(y)) if m else (0.0, 0.0)
+    i_idx, j_idx = np.triu_indices(m, k=1)
+    dx = x[j_idx] - x[i_idx]
+    valid = np.abs(dx) > 1e-15
+    slopes = (y[j_idx][valid] - y[i_idx][valid]) / dx[valid]
+    slope = float(np.median(slopes)) if len(slopes) else 0.0
+    intercept = float(np.median(y - slope * x))
+    return slope, intercept
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STAGE 2 — CATHODIC BRANCH FIT (ROBUST LOCAL LINE)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -244,52 +271,83 @@ def fit_cathodic(E, i, Ecorr):
     Ec  = E[cat]; lgi = slog(i[cat])
     si  = np.argsort(Ec); Ec, lgi = Ec[si], lgi[si]
 
-    # To bring cathodic line closer to Ecorr, reduce this to 0.015 or 0.010 if needed
-    TAFEL_GUARD = 0.020
-    base_mask = Ec < (Ecorr - TAFEL_GUARD)
-    if np.sum(base_mask) < 4: base_mask = np.ones_like(Ec, bool)
+    base_mask = Ec < (Ecorr - CFG["cath_guard"])
+    if np.sum(base_mask) < CFG["min_w_cat"]:
+        base_mask = np.ones_like(Ec, bool)
 
     Ex, Yx = Ec[base_mask], lgi[base_mask]
-    if len(Ex) < 4:
+    if len(Ex) < CFG["min_w_cat"]:
         return dict(bc=0.120, icorr=max(10**np.min(Yx),1e-12), iL=1e-2, has_diff=False, r2=0.0,
                     E_cat=Ec, lgi_cat=lgi)
 
-    w_sm = max(5, min(9, len(Ex)//2*2-1))
+    # Smooth & derivatives
+    w_sm = max(5, min(11, len(Ex)//2*2-1))
     Y_sm = savgol_filter(Yx, w_sm, 3, mode="interp")
     dY   = np.gradient(Y_sm, Ex)
     d2Y  = np.gradient(dY, Ex)
 
-    s_idx, e_idx, slope, intercept, R2 = _sliding_regress_full(Ex, Yx, min_len=4, max_len=25)
+    s_idx, e_idx, slope, intercept, R2 = _sliding_regress_full(
+        Ex, Yx, min_len=CFG["min_w_cat"], max_len=25)
     if len(slope) == 0:
-        return dict(bc=0.120, icorr=1e-9, iL=1e-2, has_diff=False, r2=0.0, E_cat=Ec, lgi_cat=lgi)
+        return dict(bc=0.120, icorr=1e-9, iL=1e-2, has_diff=False, r2=0.0,
+                    E_cat=Ec, lgi_cat=lgi)
 
+    # Window metrics
     max_d2 = np.array([np.max(np.abs(d2Y[s:e])) for s, e in zip(s_idx, e_idx)])
-    med_d1 = np.array([np.median(np.abs(dY[s:e])) for s, e in zip(s_idx, e_idx)])
-    curv_ok = max_d2 < 40.0   # can relax to 60.0 if noisy
-    flat_thr = max(np.percentile(np.abs(dY), 30), 0.5)
-    diff_ok = med_d1 > flat_thr
+    # Monotonicity: fraction with derivative sign matching slope sign
+    def _mono_frac(s, e, sl):
+        seg = dY[s:e]
+        if len(seg) == 0: return 0.0
+        return float(np.mean((seg < 0) if sl < 0 else (seg > 0)))
+    mono = np.array([_mono_frac(s, e, sl) for s, e, sl in zip(s_idx, e_idx, slope)])
 
     invm = np.where(np.abs(slope) > 1e-12, 1.0/np.abs(slope), np.inf)
-    phys = (slope < 0) & (invm > 0.02) & (invm < 0.35) & (R2 > 0.90)
-    mask_ok = phys & curv_ok & diff_ok
-    if not np.any(mask_ok): mask_ok = phys
-    if not np.any(mask_ok): mask_ok = np.ones_like(R2, bool)
+    beta_ok = (invm > CFG["beta_min"]) & (invm < CFG["beta_max_c"])
+    curv_ok = max_d2 < CFG["curvature_max"]
+    mono_ok = mono >= CFG["lin_frac"]
 
+    # Diffusion plateaus are flat relative to OLS slope; keep windows whose
+    # median |dY| is not too small compared to |slope|
+    med_d1 = np.array([np.median(np.abs(dY[s:e])) for s, e in zip(s_idx, e_idx)])
+    slope_mag = np.abs(slope) + 1e-12
+    diff_ok = med_d1 > 0.35 * slope_mag  # relative flatness guard
+
+    ok = (slope < 0) & beta_ok & curv_ok & mono_ok & diff_ok & (R2 > 0.85)
+    if not np.any(ok):
+        # relax monotonicity first, then curvature
+        ok = (slope < 0) & beta_ok & (R2 > 0.80)
+
+    # Prefer windows that END near Ecorr (cathodic side)
     E_end = Ex[e_idx - 1]
-    clos  = np.exp(-np.abs(E_end - Ecorr)/0.20)
-    score = R2 * clos; score[~mask_ok] *= 0.2
+    clos  = np.exp(-np.abs(E_end - Ecorr)/0.18)
+    score = R2 * clos * np.clip(mono, 0.2, 1.0)
+    score[~ok] *= 0.2
+
     k_best = int(np.argmax(score))
-    sl_raw, b_raw, r2_best = float(slope[k_best]), float(intercept[k_best]), float(R2[k_best])
     s0, s1 = int(s_idx[k_best]), int(e_idx[k_best])
+    sl_ols, b_ols = float(slope[k_best]), float(intercept[k_best])
 
-    sl_ref, b_ref = _huber_fit(Ex[s0:s1], Yx[s0:s1], sl_raw, b_raw)
-    bc = min(abs(1.0 / sl_ref), 0.400) if abs(sl_ref) > 1e-9 else 0.120
+    # Theil–Sen + Huber; pick better in R²
+    sl_ts, b_ts = _theil_sen(Ex[s0:s1], Yx[s0:s1])
+    sl_hb, b_hb = _huber_fit(Ex[s0:s1], Yx[s0:s1], sl_ols, b_ols)
 
+    def _r2_line(sl, b):
+        yhat = sl*Ex[s0:s1] + b
+        yy   = Yx[s0:s1]
+        return r2_score(yy, yhat)
+    cand = [(sl_ts, b_ts, _r2_line(sl_ts, b_ts)),
+            (sl_hb, b_hb, _r2_line(sl_hb, b_hb)),
+            (sl_ols, b_ols, _r2_line(sl_ols, b_ols))]
+    sl_ref, b_ref, r2_win = max(cand, key=lambda t: t[2])
+
+    bc = min(abs(1.0 / sl_ref), CFG["beta_max_c"]) if abs(sl_ref) > 1e-9 else 0.120
     icorr_tafel = float(10 ** (b_ref + sl_ref * Ecorr)) if abs(sl_ref) > 1e-9 else 1e-12
+
     near = np.abs(Ec - Ecorr) < 0.050
     icorr_near = float(np.percentile(np.abs(i[cat][si][near]), 10)) if np.any(near) else icorr_tafel
     icorr = max(min(icorr_tafel, icorr_near * 10), 1e-15)
 
+    # Diffusion assessment (unchanged)
     iL, has_diff = None, False
     if len(Ec) > 8:
         lgi_sm  = savgol_filter(lgi, max(5, min(9, len(Ec)//2*2-1)), 3, mode="interp")
@@ -302,9 +360,12 @@ def fit_cathodic(E, i, Ecorr):
                 iL = float(np.median(np.abs(i[cat][si][idxs]))); has_diff = True
     if iL is None: iL = icorr * 1e4
 
-    return dict(bc=bc, icorr=icorr, iL=iL, has_diff=has_diff, r2=r2_best,
-                E_cat=Ec, lgi_cat=lgi, slope_c=sl_ref, intercept_c=b_ref,
-                win_c=(Ex[s0], Ex[s1-1]))
+    return dict(
+        bc=bc, icorr=icorr, iL=iL, has_diff=has_diff,
+        r2=float(max(r2_win, np.max(R2) if len(R2) else 0.0)),
+        E_cat=Ec, lgi_cat=lgi,
+        slope_c=sl_ref, intercept_c=b_ref, win_c=(Ex[s0], Ex[s1-1])
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STAGE 3 — ANODIC BRANCH FIT (ROBUST LOCAL LINE)
@@ -312,57 +373,81 @@ def fit_cathodic(E, i, Ecorr):
 def fit_anodic(E, i, Ecorr):
     ano = i > 0
     if np.sum(ano) < 4:
-        return dict(ba=0.060, has_passive=False, Epass=None, ip=1e-6, has_trans=False, Etrans=None, r2=0.0)
+        return dict(ba=0.060, has_passive=False, Epass=None, ip=1e-6,
+                    has_trans=False, Etrans=None, r2=0.0)
 
     Ea  = E[ano]; lgia = slog(i[ano])
     si  = np.argsort(Ea); Ea, lgia = Ea[si], lgia[si]
 
-    TAFEL_GUARD_A = 0.010
-    base_mask = Ea > (Ecorr + TAFEL_GUARD_A)
-    if np.sum(base_mask) < 4: base_mask = np.ones_like(Ea, bool)
+    base_mask = Ea > (Ecorr + CFG["anod_guard"])
+    if np.sum(base_mask) < CFG["min_w_ano"]:
+        base_mask = np.ones_like(Ea, bool)
 
     Ex, Yx = Ea[base_mask], lgia[base_mask]
-    if len(Ex) < 4:
-        return dict(ba=0.060, has_passive=False, Epass=None, ip=1e-6, has_trans=False, Etrans=None, r2=0.0,
-                    E_an=Ea, lgi_an=lgia)
+    if len(Ex) < CFG["min_w_ano"]:
+        return dict(ba=0.060, has_passive=False, Epass=None, ip=1e-6,
+                    has_trans=False, Etrans=None, r2=0.0, E_an=Ea, lgi_an=lgia)
 
     w_sm = max(5, min(11, len(Ex)//2*2-1))
     Y_sm = savgol_filter(Yx, w_sm, 3, mode="interp")
     dY   = np.gradient(Y_sm, Ex)
     d2Y  = np.gradient(dY, Ex)
 
-    s_idx, e_idx, slope, intercept, R2 = _sliding_regress_full(Ex, Yx, min_len=3, max_len=20)
+    s_idx, e_idx, slope, intercept, R2 = _sliding_regress_full(
+        Ex, Yx, min_len=CFG["min_w_ano"], max_len=20)
     if len(slope) == 0:
-        return dict(ba=0.060, has_passive=False, Epass=None, ip=1e-6, has_trans=False, Etrans=None, r2=0.0,
-                    E_an=Ea, lgi_an=lgia)
+        return dict(ba=0.060, has_passive=False, Epass=None, ip=1e-6,
+                    has_trans=False, Etrans=None, r2=0.0, E_an=Ea, lgi_an=lgia)
 
     max_d2 = np.array([np.max(np.abs(d2Y[s:e])) for s, e in zip(s_idx, e_idx)])
-    curv_ok = max_d2 < 40.0   # can relax to 60.0 if noisy
+    # Monotonicity along anodic side (increasing)
+    def _mono_frac(s, e, sl):
+        seg = dY[s:e]
+        return float(np.mean((seg > 0))) if len(seg) else 0.0
+    mono = np.array([_mono_frac(s, e, sl) for s, e, sl in zip(s_idx, e_idx, slope)])
 
     invm = np.where(np.abs(slope) > 1e-12, 1.0/np.abs(slope), np.inf)
-    phys = (slope > 0) & (invm > 0.01) & (invm < 0.40) & (R2 > 0.85)
-    mask_ok = phys & curv_ok
-    if not np.any(mask_ok): mask_ok = phys
-    if not np.any(mask_ok): mask_ok = np.ones_like(R2, bool)
+    beta_ok = (invm > CFG["beta_min"]) & (invm < CFG["beta_max_a"])
+    curv_ok = max_d2 < CFG["curvature_max"]
+    mono_ok = mono >= CFG["lin_frac"]
 
+    ok = (slope > 0) & beta_ok & curv_ok & mono_ok & (R2 > 0.80)
+    if not np.any(ok):
+        ok = (slope > 0) & beta_ok & (R2 > 0.75)
+
+    # Prefer windows that START near Ecorr (anodic side)
     E_start = Ex[s_idx]
-    clos    = np.exp(-np.abs(E_start - Ecorr)/0.10)
-    score   = R2 * clos; score[~mask_ok] *= 0.2
+    clos    = np.exp(-np.abs(E_start - Ecorr)/0.12)
+    score   = R2 * clos * np.clip(mono, 0.2, 1.0)
+    score[~ok] *= 0.2
+
     k_best  = int(np.argmax(score))
-    sl_raw, b_raw, r2_best = float(slope[k_best]), float(intercept[k_best]), float(R2[k_best])
-    s0, s1 = int(s_idx[k_best]), int(e_idx[k_best])
+    s0, s1  = int(s_idx[k_best]), int(e_idx[k_best])
+    sl_ols, b_ols = float(slope[k_best]), float(intercept[k_best])
 
-    sl_ref, b_ref = _huber_fit(Ex[s0:s1], Yx[s0:s1], sl_raw, b_raw)
-    ba = min(abs(1.0 / sl_ref), 0.250) if abs(sl_ref) > 1e-9 else 0.040
+    sl_ts, b_ts = _theil_sen(Ex[s0:s1], Yx[s0:s1])
+    sl_hb, b_hb = _huber_fit(Ex[s0:s1], Yx[s0:s1], sl_ols, b_ols)
 
-    # active peak
+    def _r2_line(sl, b):
+        yhat = sl*Ex[s0:s1] + b
+        yy   = Yx[s0:s1]
+        return r2_score(yy, yhat)
+    cand = [(sl_ts, b_ts, _r2_line(sl_ts, b_ts)),
+            (sl_hb, b_hb, _r2_line(sl_hb, b_hb)),
+            (sl_ols, b_ols, _r2_line(sl_ols, b_ols))]
+    sl_ref, b_ref, r2_win = max(cand, key=lambda t: t[2])
+
+    ba = min(abs(1.0 / sl_ref), CFG["beta_max_a"]) if abs(sl_ref) > 1e-9 else 0.040
+
+    # Active peak (unchanged)
     Epeak_detected = None
     if len(Ea) > 4:
         pks, _ = find_peaks(lgia, prominence=0.3, distance=2)
         if len(pks) > 0:
-            pk = int(np.argmin(np.abs(Ea[pks] - Ecorr))); Epeak_detected = float(Ea[pks[pk]])
+            pk = int(np.argmin(np.abs(Ea[pks] - Ecorr)))
+            Epeak_detected = float(Ea[pks[pk]])
 
-    # passive / transpassive
+    # Passive / Transpassive detection (unchanged)
     has_passive = False; Epass = None; ip = 1e-6
     has_trans   = False; Etrans = None
     if len(Ea) > 8:
@@ -370,25 +455,34 @@ def fit_anodic(E, i, Ecorr):
         dlg     = np.gradient(lgia_sm, Ea); adlg = np.abs(dlg)
         thr  = max(np.percentile(adlg, 30), 0.8)
         flat = adlg < thr
+
         runs = [(k, list(g)) for k, g in groupby(enumerate(flat), key=lambda x: x[1]) if k]
         for _, ri in runs:
-            idxs = [s[0] for s in ri]; span = abs(Ea[idxs[-1]] - Ea[idxs[0]])
+            idxs = [s[0] for s in ri]
+            span = abs(Ea[idxs[-1]] - Ea[idxs[0]])
             if len(idxs) >= 4 and span > 0.06:
                 ip_cand = float(np.median(np.abs(i[ano][si][idxs])))
                 if ip_cand < float(np.max(np.abs(i[ano]))) * 0.7:
-                    has_passive, Epass, ip = True, float(Ea[idxs[0]]), ip_cand
+                    has_passive = True
+                    Epass       = float(Ea[idxs[0]])
+                    ip          = ip_cand
                     post = Ea > Ea[idxs[-1]]
                     if np.sum(post) > 3:
-                        post_dlg = dlg[np.where(post)[0]]; post_E = Ea[np.where(post)[0]]
+                        post_dlg = dlg[np.where(post)[0]]
+                        post_E   = Ea[np.where(post)[0]]
                         rising   = np.where(post_dlg > 3.0)[0]
                         if len(rising) > 0:
-                            has_trans, Etrans = True, float(post_E[rising[0]])
+                            has_trans = True
+                            Etrans    = float(post_E[rising[0]])
                     break
 
-    return dict(ba=ba, has_passive=has_passive, Epass=Epass, ip=ip,
-                has_trans=has_trans, Etrans=Etrans, Epeak=Epeak_detected,
-                r2=float(r2_best), E_an=Ea, lgi_an=lgia,
-                slope_a=sl_ref, intercept_a=b_ref, win_a=(Ex[s0], Ex[s1-1]))
+    return dict(
+        ba=ba, has_passive=has_passive, Epass=Epass, ip=ip,
+        has_trans=has_trans, Etrans=Etrans, Epeak=Epeak_detected,
+        r2=float(max(r2_win, np.max(R2) if len(R2) else 0.0)),
+        E_an=Ea, lgi_an=lgia,
+        slope_a=sl_ref, intercept_a=b_ref, win_a=(Ex[s0], Ex[s1-1])
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STAGE 4 — CLASSIFY CURVE TYPE
@@ -404,10 +498,6 @@ def classify_curve(cat_res, an_res):
 # TAfel intersection (local lines)
 # ─────────────────────────────────────────────────────────────────────────────
 def tafel_intersection(cat_res, an_res):
-    """
-    Intersection of local anodic and cathodic Tafel regressions in log10|i| vs E.
-    Returns (E_tafel, i_corr_tafel, log10_i_corr_tafel) or None.
-    """
     if ("slope_c" in cat_res and "intercept_c" in cat_res and
         "slope_a" in an_res  and "intercept_a" in an_res):
         mc = float(cat_res["slope_c"]); bc = float(cat_res["intercept_c"])
@@ -575,7 +665,8 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
                 show_regions=True, dpi=150):
     Ecorr_fit = float(best_p[0])
 
-    ba, bc = max(float(best_p[3-1+1]), 1e-9), max(float(best_p[3]), 1e-9)  # ba=p[2], bc=p[3]
+    ba    = max(float(best_p[2]), 1e-9)
+    bc    = max(float(best_p[3]), 1e-9)
     icorr_model = float(best_p[1])
 
     E_lo, E_hi = float(E.min()), float(E.max())
@@ -583,19 +674,24 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
     n_dense = int(np.clip(200 * span, 800, 2500))
     E_dense = np.linspace(E_lo, E_hi, n_dense)
 
-    i_dense = pol_model(E_dense, best_p, ct)
-    i_fit_E = pol_model(E, best_p, ct)
-    log_obs = slog(i_obs); log_den = slog(i_dense); log_fitE = slog(i_fit_E)
-    residuals = log_obs - log_fitE
-    r2v, rmse = r2_score(log_obs, log_fitE), float(np.sqrt(np.mean(residuals**2)))
+    i_dense    = pol_model(E_dense, best_p, ct)
+    i_fit_E    = pol_model(E, best_p, ct)
+    log_obs    = slog(i_obs)
+    log_den    = slog(i_dense)
+    log_fitE   = slog(i_fit_E)
+    residuals  = log_obs - log_fitE
+    r2v  = r2_score(log_obs, log_fitE)
+    rmse = float(np.sqrt(np.mean(residuals**2)))
 
     fin  = log_obs[np.isfinite(log_obs)]
     y_lo = float(np.nanmin(fin)) - 0.2
+
     if ct in CT.PASS:
         Epass_4y = float(best_p[4])
         act_mask = (E >= Ecorr_fit - 0.02) & (E <= Epass_4y + 0.05)
         if np.sum(act_mask) >= 2:
-            log_act = slog(i_obs[act_mask]); log_act = log_act[np.isfinite(log_act)]
+            log_act = slog(i_obs[act_mask])
+            log_act = log_act[np.isfinite(log_act)]
             active_peak_log = float(np.max(log_act)) if len(log_act) > 0 else np.log10(max(icorr_model,TINY))
         else:
             active_peak_log = np.log10(max(icorr_model,TINY)) + 2.303 * (Epass_4y - Ecorr_fit) / ba
@@ -603,49 +699,59 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
         y_hi = max(active_peak_log + 1.5, logIp_val + 2.0)
     else:
         y_hi = float(np.percentile(fin, 90)) + 1.0
+
     y_hi = min(y_hi, float(np.percentile(fin, 99)) + 1.8)
 
+    # Model partials (fallback)
     logI_cat_model = np.log10(np.clip(icorr_model * np.exp(2.303*(Ecorr_fit-E_dense)/bc), TINY, None))
     logI_ano_model = np.log10(np.clip(icorr_model * np.exp(2.303*(E_dense-Ecorr_fit)/ba), TINY, None))
 
-    # Select i_corr/E_corr for annotations
+    # Decide display i_corr / E_corr
     icorr_display, ecorr_display = icorr_model, Ecorr_fit
     if taf is not None and use_tafel_icorr:
         E_tafel, i_tafel, logI_tafel = taf
-        if (E_lo - 0.2*span) <= E_tafel <= (E_hi + 0.2*span) and np.isfinite(i_tafel) and i_tafel > 0:
+        if E_lo - 0.2*span <= E_tafel <= E_hi + 0.2*span and np.isfinite(i_tafel) and i_tafel > 0:
             icorr_display, ecorr_display = i_tafel, E_tafel
 
     with plt.rc_context(PLT_RC):
         fig = plt.figure(figsize=(14, 10), dpi=dpi)
-        gs  = GridSpec(2, 3, figure=fig, hspace=0.44, wspace=0.36,
+        gs  = GridSpec(2, 3, figure=fig,
+                       hspace=0.44, wspace=0.36,
                        left=0.07, right=0.97, top=0.93, bottom=0.08)
         ax_ev  = fig.add_subplot(gs[0, :])
         ax_br  = fig.add_subplot(gs[1, 0])
         ax_lin = fig.add_subplot(gs[1, 1])
         ax_res = fig.add_subplot(gs[1, 2])
 
-        # Evans Diagram
+        # ══ PANEL A ══════════════════════════════════════════════════════════
         ax = ax_ev
+
         if show_regions:
             def vband(e0, e1, key, lbl):
                 c, a = REGION_COLORS[key]
-                e0c, e1c = float(np.clip(e0, E_lo, E_hi)), float(np.clip(e1, E_lo, E_hi))
-                if e1c > e0c: ax.axvspan(e0c, e1c, color=c, alpha=a, lw=0, label=lbl, zorder=1)
+                e0c = float(np.clip(e0, E_lo, E_hi))
+                e1c = float(np.clip(e1, E_lo, E_hi))
+                if e1c > e0c:
+                    ax.axvspan(e0c, e1c, color=c, alpha=a, lw=0, label=lbl, zorder=1)
             vband(E_lo, Ecorr_fit, "cathodic", "Cathodic region")
             if ct in CT.SIMPLE:
                 vband(Ecorr_fit, E_hi, "active", "Anodic (active)")
             elif ct in CT.PASS:
-                Ep = float(best_p[4]); Et = float(best_p[7]) if ct in CT.TRANS else E_hi + 1
+                Ep = float(best_p[4])
+                Et = float(best_p[7]) if ct in CT.TRANS else E_hi + 1
                 vband(Ecorr_fit, min(Ep, E_hi), "active", "Active dissolution")
                 vband(min(Ep, E_hi), min(Et, E_hi), "passive", "Passive region")
-                if ct in CT.TRANS and Et < E_hi: vband(Et, E_hi, "transpassive", "Transpassive / pitting")
+                if ct in CT.TRANS and Et < E_hi:
+                    vband(Et, E_hi, "transpassive", "Transpassive / pitting")
 
+        # Experimental data
         ax.scatter(E, log_obs, s=12, color="#4a7fa8", alpha=0.60,
                    zorder=2, label="Experimental data", linewidths=0, rasterized=True)
+        # Fitted model
         ax.plot(E_dense, log_den, color="#1a3a5c", lw=2.0, zorder=5,
                 label=f"Global fit  (R\u00b2={r2v:.5f})")
 
-        # Draw local regression segments (with optional faint extension)
+        # Draw local regression segments
         def _draw_segment(ax, slope, intercept, win, color, label,
                           extend_to=None, extend_color=None, extend_alpha=0.35):
             e0, e1 = float(win[0]), float(win[1])
@@ -664,26 +770,31 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
                     ax.plot(E_ext, slope * E_ext + intercept, "--", color=extend_color or color, lw=1.6, alpha=extend_alpha, zorder=5)
             return True
 
-        drew_c = drew_a = False
+        # Cathodic
+        drew_c = False
         if ("slope_c" in cat_res) and ("intercept_c" in cat_res) and ("win_c" in cat_res):
-            lab_c = f"βc (local) = {min(abs(1.0/cat_res['slope_c']),0.400)*1000:.0f} mV/dec"
-            ext = (E_lo, min(Ecorr_fit, E_hi)) if extend_tafel else None
+            lab_c = f"βc (local) = {min(abs(1.0/cat_res['slope_c']),CFG['beta_max_c'])*1000:.0f} mV/dec"
+            ext = (E_lo, min(Ecorr_fit, E_hi)) if True else None
             drew_c = _draw_segment(ax, cat_res["slope_c"], cat_res["intercept_c"],
                                    cat_res["win_c"], "#8e44ad", lab_c,
                                    extend_to=ext, extend_color="#8e44ad", extend_alpha=0.30)
+
+        # Anodic
+        drew_a = False
         if ("slope_a" in an_res) and ("intercept_a" in an_res):
             if "win_a" in an_res:
                 e0, e1 = an_res["win_a"]
-                if ct in CT.PASS and best_p[4] is not None: e1 = min(e1, float(best_p[4]))
+                if ct in CT.PASS and best_p[4] is not None:
+                    e1 = min(e1, float(best_p[4]))
             else:
                 e0, e1 = Ecorr_fit, E_hi
-            lab_a = f"βa (local) = {min(abs(1.0/an_res['slope_a']),0.250)*1000:.0f} mV/dec"
-            ext = (max(Ecorr_fit, E_lo), E_hi) if extend_tafel else None
+            lab_a = f"βa (local) = {min(abs(1.0/an_res['slope_a']),CFG['beta_max_a'])*1000:.0f} mV/dec"
+            ext = (max(Ecorr_fit, E_lo), E_hi) if True else None
             drew_a = _draw_segment(ax, an_res["slope_a"], an_res["intercept_a"],
                                    (e0, e1), "#e67e22", lab_a,
                                    extend_to=ext, extend_color="#e67e22", extend_alpha=0.30)
 
-        # Fallback to model partials if local not drawn
+        # Fallbacks to model partials
         if not drew_c:
             msk_cat = (logI_cat_model >= y_lo - 0.05) & (logI_cat_model <= y_hi + 0.05) & (E_dense <= Ecorr_fit + 0.005)
             if np.any(msk_cat):
@@ -700,7 +811,7 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
                 ax.plot(E_dense[msk_ano], logI_ano_model[msk_ano], "--", color="#e67e22", lw=2.2, zorder=6,
                         label=f"βa = {ba*1000:.0f} mV/dec")
 
-        # Annotate using chosen display values
+        # Crossing point + drop-lines (using display values)
         logIc_disp = np.log10(max(icorr_display, TINY))
         ax.plot(ecorr_display, logIc_disp, "x", color="#e84393", ms=12, mew=2.5, zorder=8)
         ax.plot([ecorr_display, ecorr_display], [y_lo, logIc_disp], ":", color="#e84393", lw=1.2, alpha=0.85, zorder=3)
@@ -722,7 +833,8 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
                        ls=":", lw=1.1, alpha=0.75, zorder=3,
                        label=f"i_pass = {ip_val:.2e} A/cm\u00b2")
 
-        ax.set_xlim(E_lo, E_hi); ax.set_ylim(y_lo, y_hi)
+        ax.set_xlim(E_lo, E_hi)
+        ax.set_ylim(y_lo, y_hi)
         ax.set_xlabel("E vs. Reference (V)")
         ax.set_ylabel("log\u2081\u2080 |i| (A cm\u207b\u00b2)")
         ax.set_title(f"Evans Diagram — {sample_name}")
@@ -731,13 +843,17 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
         ax.tick_params(which="both", top=True, right=True)
         ax.grid(True, which="major", ls="--", alpha=0.45)
         ax.grid(True, which="minor", ls=":", alpha=0.18)
+        ax.legend(loc="lower right", ncol=4, fontsize=7.5,
+                  framealpha=0.95, edgecolor="#cccccc")
         r2c = "#27ae60" if r2v > 0.99 else "#e67e22" if r2v > 0.95 else "#e84393"
-        ax.legend(loc="lower right", ncol=4, fontsize=7.5, framealpha=0.95, edgecolor="#cccccc")
-        ax.text(0.01, 0.97, f"R\u00b2={r2v:.5f}  RMSE={rmse:.4f}  Model: {CT.name(ct)}",
-                transform=ax.transAxes, fontsize=8.5, color=r2c, fontweight="bold", va="top",
-                bbox=dict(fc="white", ec=r2c, alpha=0.88, pad=3, boxstyle="round,pad=0.3"))
+        ax.text(0.01, 0.97,
+                f"R\u00b2={r2v:.5f}  RMSE={rmse:.4f}  Model: {CT.name(ct)}",
+                transform=ax.transAxes, fontsize=8.5, color=r2c,
+                fontweight="bold", va="top",
+                bbox=dict(fc="white", ec=r2c, alpha=0.88, pad=3,
+                          boxstyle="round,pad=0.3"))
 
-        # Panel B — Branch Fits
+        # ══ PANEL B — Branch Fits (same segments) ═════════════════════════════
         ax = ax_br
         E_ds, log_obs_ds = downsample_uniform(E, log_obs, 400)
         ax.scatter(E_ds, log_obs_ds, s=5, color="#aab4c4", alpha=0.28, zorder=1, linewidths=0, rasterized=True)
@@ -755,7 +871,7 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
             if len(E_seg) > 1:
                 ax.plot(E_seg, cat_res["slope_c"] * E_seg + cat_res["intercept_c"],
                         "--", color="#3182bd", lw=1.6, zorder=4,
-                        label=f"βc(local)={min(abs(1.0/cat_res['slope_c']),0.400)*1000:.0f} mV/dec")
+                        label=f"βc(local)={min(abs(1.0/cat_res['slope_c']),CFG['beta_max_c'])*1000:.0f} mV/dec")
         if "slope_a" in an_res and "intercept_a" in an_res:
             if "win_a" in an_res:
                 e0, e1 = an_res["win_a"]
@@ -766,15 +882,17 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
             if len(E_seg) > 1:
                 ax.plot(E_seg, an_res["slope_a"] * E_seg + an_res["intercept_a"],
                         "--", color="#e6550d", lw=1.6, zorder=4,
-                        label=f"βa(local)={min(abs(1.0/an_res['slope_a']),0.250)*1000:.0f} mV/dec")
+                        label=f"βa(local)={min(abs(1.0/an_res['slope_a']),CFG['beta_max_a'])*1000:.0f} mV/dec")
         if an_res["has_passive"] and an_res["Epass"] is not None:
             ax.axvline(float(an_res["Epass"]), color="#27ae60",
-                       ls="-.", lw=1.0, alpha=0.85, label=f"E_pass={an_res['Epass']:.3f}V")
+                       ls="-.", lw=1.0, alpha=0.85,
+                       label=f"E_pass={an_res['Epass']:.3f}V")
         ax.axvline(ecorr_display, color="#e84393", ls="--", lw=1.2, zorder=3)
-        ax.axhline(np.log10(max(icorr_display, TINY)), color="#e84393",
-                   ls=":", lw=1.0, alpha=0.7)
-        ax.set_xlim(E_lo, E_hi); ax.set_ylim(y_lo, y_hi)
-        ax.set_xlabel("E (V)"); ax.set_ylabel("log\u2081\u2080 |i|")
+        ax.axhline(logIc_disp, color="#e84393", ls=":", lw=1.0, alpha=0.7)
+        ax.set_xlim(E_lo, E_hi)
+        ax.set_ylim(y_lo, y_hi)
+        ax.set_xlabel("E (V)")
+        ax.set_ylabel("log\u2081\u2080 |i|")
         ax.set_title("Branch Fits (Stage 2–3)")
         ax.xaxis.set_minor_locator(AutoMinorLocator(5))
         ax.yaxis.set_minor_locator(AutoMinorLocator(5))
@@ -782,33 +900,41 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
         ax.grid(True, which="major", ls="--", alpha=0.4)
         ax.legend(fontsize=7.5, loc="upper right")
 
-        # Panel C — Linear i vs E
+        # ══ PANEL C — Linear i vs E ═══════════════════════════════════════════
         ax = ax_lin
         i_p95 = float(np.percentile(np.abs(i_obs), 95))
-        uscale, ulbl = (1e9,"nA/cm\u00b2") if i_p95 < 1e-6 else ((1e6,"\u03bcA/cm\u00b2") if i_p95 < 1e-3 else (1e3,"mA/cm\u00b2"))
+        if i_p95 < 1e-6:
+            uscale, ulbl = 1e9,  "nA/cm\u00b2"
+        elif i_p95 < 1e-3:
+            uscale, ulbl = 1e6,  "\u03bcA/cm\u00b2"
+        else:
+            uscale, ulbl = 1e3,  "mA/cm\u00b2"
         ylim_lin = max(i_p95 * uscale * 1.20, 1e-12)
-        E_lin_ds, i_obs_lin_ds = downsample_uniform(E, i_obs, 800)
         i_fit_cl = np.clip(i_dense * uscale, -ylim_lin * 3, ylim_lin * 3)
+        E_lin_ds, i_obs_lin_ds = downsample_uniform(E, i_obs, 800)
         ax.scatter(E_lin_ds, i_obs_lin_ds * uscale, s=9, color="#4a7fa8",
                    alpha=0.65, zorder=2, label="Data", linewidths=0, rasterized=True)
         ax.plot(E_dense, i_fit_cl, color="#1a3a5c", lw=2.0, zorder=5, label="Fit")
         ax.axhline(0, color="#888", lw=0.7, zorder=1)
         ax.axvline(ecorr_display, color="#e84393", ls="--", lw=1.2, zorder=3)
-        ax.set_xlim(E_lo, E_hi); ax.set_ylim(-ylim_lin, ylim_lin)
-        ax.set_xlabel("E (V)"); ax.set_ylabel(f"i ({ulbl})"); ax.set_title("Linear Scale")
+        ax.set_xlim(E_lo, E_hi)
+        ax.set_ylim(-ylim_lin, ylim_lin)
+        ax.set_xlabel("E (V)")
+        ax.set_ylabel(f"i ({ulbl})")
+        ax.set_title("Linear Scale")
         ax.xaxis.set_minor_locator(AutoMinorLocator(5))
         ax.yaxis.set_minor_locator(AutoMinorLocator(5))
         ax.tick_params(which="both", top=True, right=True)
         ax.grid(True, which="major", ls="--", alpha=0.4)
         ax.legend(fontsize=8)
 
-        # Panel D — Residuals
+        # ══ PANEL D — Residuals ═══════════════════════════════════════════════
         ax = ax_res
         ax.fill_between([E_lo, E_hi], -0.1, 0.1, color="#e84393", alpha=0.07, zorder=1)
         ax.scatter(E, residuals, s=10, color="#2e86de", alpha=0.65, zorder=3, linewidths=0, rasterized=True)
         ax.axhline(0,    color="#333",    lw=0.9, zorder=2)
         ax.axhline( 0.1, color="#e84393", ls=":", lw=1.0, alpha=0.7)
-        ax.axhline(-0.1, color="#e84393", ls=":", lw=1.0, alpha=0.7, label="±0.1 log")
+        ax.axhline(-0.1, color="#e84393", ls=":", lw=1.0, alpha=0.7, label="\u00b10.1 log")
         ax.axvline(ecorr_display, color="#e84393", ls="--", lw=0.9, alpha=0.6)
         ax.set_xlim(E_lo, E_hi)
         ax.set_xlabel("E (V)")
@@ -987,6 +1113,17 @@ with st.sidebar:
     smooth_pre = st.toggle("Pre-smooth (Savitzky-Golay)", False)
     pub_dpi    = st.slider("Export DPI", 150, 600, 300, 50)
 
+    with st.expander("Advanced (Tafel window detection)"):
+        CFG["anod_guard"]   = st.number_input("Anodic guard from Ecorr (V)", 0.0, 0.100, CFG["anod_guard"], 0.001, format="%.3f")
+        CFG["cath_guard"]   = st.number_input("Cathodic guard from Ecorr (V)", 0.0, 0.150, CFG["cath_guard"], 0.001, format="%.3f")
+        CFG["curvature_max"]= st.number_input("Curvature max |d²log|i|/dE²|", 10.0, 200.0, CFG["curvature_max"], 1.0)
+        CFG["lin_frac"]     = st.slider("Linearity fraction (derivative consistency)", 0.4, 0.95, CFG["lin_frac"], 0.05)
+        CFG["min_w_ano"]    = st.number_input("Min window points (anodic)", 3, 20, CFG["min_w_ano"])
+        CFG["min_w_cat"]    = st.number_input("Min window points (cathodic)", 4, 25, CFG["min_w_cat"])
+        CFG["beta_min"]     = st.number_input("β min (V/dec)", 0.005, 0.100, CFG["beta_min"], 0.005, format="%.3f")
+        CFG["beta_max_a"]   = st.number_input("βa max (V/dec)", 0.10, 0.60, CFG["beta_max_a"], 0.01)
+        CFG["beta_max_c"]   = st.number_input("βc max (V/dec)", 0.10, 0.60, CFG["beta_max_c"], 0.01)
+
     st.markdown("**Fitting**")
     force_ct_val = st.selectbox("Force model (auto = best AICc)",
                                 ["auto","A","AD","P","PT","F"],
@@ -1023,7 +1160,7 @@ with tab_fit:
         sample_name = st.text_input("Sample label", "Sample 1")
 
     if uploaded_files:
-        # IMPORTANT: use index-based widget keys to avoid NameError from uf.name scopes
+        # Use index-based widget keys (no NameError)
         for idx, uf in enumerate(uploaded_files):
             st.markdown(f"---\n#### 📄 `{uf.name}`")
             with st.container():
@@ -1188,7 +1325,7 @@ with tab_fit:
                         f"(elapsed `{time.time()-t0:.1f}` s)")
                     prog.progress(95, text="Building figure…")
 
-                    # Tafel intersection for annotation/metrics
+                    # Tafel intersection
                     taf = tafel_intersection(cat_res, an_res)
 
                     # ── Figure ──────────────────────────────────────────────
@@ -1210,7 +1347,6 @@ with tab_fit:
                                     facecolor="white"); buf_svg.seek(0)
                         svg_bytes = buf_svg.read()
 
-                        # Store result
                         res_rec = dict(
                             name=sample_name or uf.name,
                             params=best_p, ct=best_ct,
@@ -1383,17 +1519,22 @@ with tab_help:
 - Curvature near E\_corr (IR/mixed control) is intentionally excluded by the curvature guard.
 - The app draws the exact linear window (dashed) and can extend it faintly to E\_corr (toggle in sidebar) for clarity.
 
-### Tuning dials (if you want a longer cathodic line)
-- In `fit_cathodic`, lower `TAFEL_GUARD` (e.g., 0.015 → 0.010) to allow windows closer to E\_corr.
-- In both fits, increase the curvature threshold from 40.0 → 60.0 for noisier data.
-- Toggle “Use Tafel intersection for i_corr” off to show the global model i_corr for diagnostics.
+### If the anodic linear region is not detected
+- Reduce “Anodic guard” to 0.008–0.012 V.
+- Increase “Curvature max” to ~60 if the data are noisy but visually straight.
+- Lower “Linearity fraction” to ~0.6 for very short windows.
+
+### If the cathodic fit looks bad
+- Reduce “Cathodic guard” to ~0.015 V so the window can end closer to E\_corr.
+- Keep “Linearity fraction” ≥ 0.7 and ensure “βc max” is not too tight.
+- For diffusion plateaus, the algorithm will pick the pre‑plateau straight part; enable extension to Ecorr for visual completeness.
 
 ### Fitting Pipeline
 
 | Stage | What happens |
 |---|---|
 | **1 — E_corr detection** | Interpolated zero-crossing of signed current |
-| **2 — Cathodic fit** | Vectorized sliding regression + curvature/diffusion guards; Huber-refined local line |
+| **2 — Cathodic fit** | Vectorized sliding regression + curvature/diffusion/monotonicity guards; Theil–Sen/Huber refinement |
 | **3 — Anodic fit** | Same for anodic; passive plateau via flat log\\|i\\| region; transpassive detection |
 | **4 — Classification** | Curve type inferred from detected features |
 | **5 — Global polish** | Physics-informed p₀ → DE (light) → L-BFGS-B (Powell if needed) |
