@@ -924,6 +924,11 @@ with st.sidebar:
     smooth_pre = st.toggle("Pre-smooth (Savitzky-Golay)", False)
     pub_dpi    = st.slider("Export DPI", 150, 600, 300, 50)
 
+    st.markdown("**Fitting**")
+    force_ct_val = st.selectbox("Force model (auto = best AICc)",
+                                ["auto","A","AD","P","PT","F"],
+                                key="force_ct_choice")
+
     st.divider()
     if st.button("🗑 Clear all", use_container_width=True):
         st.session_state.results = []; st.session_state.figures = []; st.rerun()
@@ -1032,20 +1037,8 @@ with tab_fit:
 
                     E_lo, E_hi, E_sp = float(E.min()), float(E.max()), float(E.max()-E.min())
 
-                    # Clean if/else block (no inline conditional)
-                    if st.session_state.get("force_ct_selection", None):
-                        pass  # backward compatibility guard
-                    if 'force_ct' not in locals() and 'force_ct' not in globals():
-                        # ensure we can reference the widget from sidebar scope
-                        pass
-                    # Read the widget from sidebar captured variable
-                    # (defined in the sidebar section as force_ct)
-                    # Build candidates
-                    if st.session_state.get("Force model (auto = best AICc)", None):
-                        pass  # ignore; we have the local 'force_ct' variable from sidebar closure
-
-                    # Use the force_ct variable defined in sidebar
-                    if force_ct == "auto":
+                    # Build candidate list safely using the sidebar value (no NameError)
+                    if force_ct_val == "auto":
                         candidates = [ct_detected]
                         if ct_detected in (CT.A, CT.AD):
                             candidates.append(CT.P)
@@ -1053,14 +1046,13 @@ with tab_fit:
                             candidates.extend([CT.P, CT.PT])
                         if cat_res["has_diff"]:
                             candidates.append(CT.AD)
-                        # deduplicate while preserving order
                         seen = set(); uniq = []
                         for c in candidates:
                             if c not in seen:
                                 uniq.append(c); seen.add(c)
                         candidates = uniq
                     else:
-                        candidates = [force_ct]
+                        candidates = [force_ct_val]
 
                     all_res = []; n_cand = len(candidates)
                     for k_c, ct_try in enumerate(candidates):
