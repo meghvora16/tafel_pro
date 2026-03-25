@@ -805,11 +805,12 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
         ax = ax_res
         ax.fill_between([E_lo, E_hi], -0.1, 0.1, color="#e84393", alpha=0.07, zorder=1)
         ax.scatter(E, residuals, s=10, color="#2e86de", alpha=0.65, zorder=3, linewidths=0, rasterized=True)
-        ax.axhline(0, color="#333", lw=0.9, zorder=2)
+        ax.axhline(0,    color="#333",    lw=0.9, zorder=2)
         ax.axhline( 0.1, color="#e84393", ls=":", lw=1.0, alpha=0.7)
         ax.axhline(-0.1, color="#e84393", ls=":", lw=1.0, alpha=0.7, label="±0.1 log")
         ax.axvline(ecorr_display, color="#e84393", ls="--", lw=0.9, alpha=0.6)
-        ax.set_xlim(E_lo, E_hi); ax.set_xlabel("E (V)")
+        ax.set_xlim(E_lo, E_hi)
+        ax.set_xlabel("E (V)")
         ax.set_ylabel("\u0394 log\u2081\u2080 |i|")
         ax.set_title(f"Residuals   R\u00b2={r2v:.5f}")
         ax.xaxis.set_minor_locator(AutoMinorLocator(5))
@@ -1135,7 +1136,7 @@ with tab_fit:
                     # Stage 5 — Global optimisation
                     E_lo = float(E.min()); E_hi = float(E.max()); E_sp = E_hi - E_lo
 
-                    # Build candidate list using the sidebar selection (safe, no NameError)
+                    # Candidate models — safe session-backed selector
                     force_choice = st.session_state.get("force_ct_choice", "auto")
                     if force_choice == "auto":
                         candidates = [ct_detected]
