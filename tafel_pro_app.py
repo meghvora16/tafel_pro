@@ -4,9 +4,9 @@ Polarization Curve Fitter — Publication-Grade Streamlit App (Robust Tafel Over
 Key features:
 - Vectorized sliding-window regressions with curvature & diffusion guards
 - Huber refinement (IRLS) on the chosen Tafel window
-- Local Tafel dashed lines drawn as straight segments over the selected windows (with optional faint extension)
-- i_corr annotated from Tafel intersection of local anodic/cathodic lines (if available)
-- Adaptive plotting, rasterized scatters, and lean optimization
+- Local Tafel dashed lines drawn as straight segments over selected windows (with optional faint extension)
+- i_corr annotated from Tafel intersection of local anodic/cathodic lines (toggleable)
+- Adaptive plotting and lean optimization
 """
 
 import streamlit as st
@@ -233,12 +233,6 @@ def _huber_fit(x, y, slope, intercept, iters=3, c=1.345):
 # STAGE 2 — CATHODIC BRANCH FIT (ROBUST LOCAL LINE)
 # ─────────────────────────────────────────────────────────────────────────────
 def fit_cathodic(E, i, Ecorr):
-    """
-    Cathodic Tafel fit on log|i| vs E with:
-    - vectorized sliding windows
-    - curvature & diffusion guards
-    - Huber-refined regression
-    """
     cat = i < 0
     if np.sum(cat) < 4:
         return dict(bc=0.120, icorr=1e-8, iL=1e-2, has_diff=False, r2=0.0)
@@ -246,7 +240,7 @@ def fit_cathodic(E, i, Ecorr):
     Ec  = E[cat]; lgi = slog(i[cat])
     si  = np.argsort(Ec); Ec, lgi = Ec[si], lgi[si]
 
-    TAFEL_GUARD = 0.020  # decrease to 0.015 if you want windows closer to Ecorr
+    TAFEL_GUARD = 0.020  # reduce to 0.015 if you want windows closer to Ecorr
     base_mask = Ec < (Ecorr - TAFEL_GUARD)
     if np.sum(base_mask) < 4: base_mask = np.ones_like(Ec, bool)
 
@@ -613,7 +607,6 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
     icorr_display, ecorr_display = icorr_model, Ecorr_fit
     if taf is not None and use_tafel_icorr:
         E_tafel, i_tafel, logI_tafel = taf
-        # Only adopt if intersection is reasonably close to view
         if E_lo - 0.2*span <= E_tafel <= E_hi + 0.2*span and np.isfinite(i_tafel) and i_tafel > 0:
             icorr_display, ecorr_display = i_tafel, E_tafel
 
@@ -642,7 +635,7 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
         ax.scatter(E, log_obs, s=12, color="#4a7fa8", alpha=0.60, zorder=2, label="Experimental data", linewidths=0, rasterized=True)
         ax.plot(E_dense, log_den, color="#1a3a5c", lw=2.0, zorder=5, label=f"Global fit  (R\u00b2={r2v:.5f})")
 
-        # Draw local regression segments (preferred) — with optional faint extension
+        # Draw local regression segments with optional faint extension
         def _draw_segment(ax, slope, intercept, win, color, label, extend_to=None, extend_color=None, extend_alpha=0.35):
             e0, e1 = float(win[0]), float(win[1])
             e0p, e1p = max(E_lo, e0), min(E_hi, e1)
@@ -668,6 +661,7 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
                 ext = (E_lo, min(Ecorr_fit, E_hi)) if extend_tafel else None
                 drew_c = _draw_segment(ax, cat_res["slope_c"], cat_res["intercept_c"], cat_res["win_c"],
                                        "#8e44ad", lab_c, extend_to=ext, extend_color="#8e44ad", extend_alpha=0.30)
+
         # Anodic
         drew_a = False
         if ("slope_a" in an_res) and ("intercept_a" in an_res):
@@ -789,7 +783,6 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
         ax.tick_params(which="both", top=True, right=True); ax.grid(True, which="major", ls="--", alpha=0.4); ax.legend(fontsize=8)
 
         fig.suptitle("Polarisation Curve Analysis", fontsize=12, fontweight="bold", color="#1a3a5c", y=0.98)
-    # return fig and stats
     return fig, r2v, rmse, icorr_display, ecorr_display
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1039,12 +1032,35 @@ with tab_fit:
 
                     E_lo, E_hi, E_sp = float(E.min()), float(E.max()), float(E.max()-E.min())
 
-                    candidates = [ct_detected] if ct_detected else [CT.A]
-                    candidates = list(dict.fromkeys(
-                        [ct_detected] + ([CT.P] if ct_detected in (CT.A, CT.AD) else []) +
-                        ([CT.P, CT.PT] if an_res["has_passive"] else []) +
-                        ([CT.AD] if cat_res["has_diff"] else [])
-                    )) if force_ct == "auto" else [force_ct]
+                    # Clean if/else block (no inline conditional)
+                    if st.session_state.get("force_ct_selection", None):
+                        pass  # backward compatibility guard
+                    if 'force_ct' not in locals() and 'force_ct' not in globals():
+                        # ensure we can reference the widget from sidebar scope
+                        pass
+                    # Read the widget from sidebar captured variable
+                    # (defined in the sidebar section as force_ct)
+                    # Build candidates
+                    if st.session_state.get("Force model (auto = best AICc)", None):
+                        pass  # ignore; we have the local 'force_ct' variable from sidebar closure
+
+                    # Use the force_ct variable defined in sidebar
+                    if force_ct == "auto":
+                        candidates = [ct_detected]
+                        if ct_detected in (CT.A, CT.AD):
+                            candidates.append(CT.P)
+                        if an_res["has_passive"]:
+                            candidates.extend([CT.P, CT.PT])
+                        if cat_res["has_diff"]:
+                            candidates.append(CT.AD)
+                        # deduplicate while preserving order
+                        seen = set(); uniq = []
+                        for c in candidates:
+                            if c not in seen:
+                                uniq.append(c); seen.add(c)
+                        candidates = uniq
+                    else:
+                        candidates = [force_ct]
 
                     all_res = []; n_cand = len(candidates)
                     for k_c, ct_try in enumerate(candidates):
@@ -1217,7 +1233,12 @@ with tab_help:
 ### Why the cathodic dashed line can look shorter
 - Diffusion-limited plateaus flatten the cathodic branch; only a short region far from E\_corr is truly linear.
 - Curvature near E\_corr (IR/mixed control) is intentionally excluded by the curvature guard.
-- The app now draws the exact linear window (dashed) and extends it faintly to E\_corr for clarity.
+- The app draws the exact linear window (dashed) and extends it faintly to E\_corr (toggle in sidebar) for clarity.
+
+### Tuning dials (if you want a longer cathodic line)
+- In `fit_cathodic`, reduce `TAFEL_GUARD` (e.g., 0.015) to allow windows closer to E\_corr.
+- In both fits, increase the curvature threshold from 40.0 to ~60.0 for noisier data.
+- Disable “Use Tafel intersection for i_corr” to display the global model’s i_corr for diagnostics.
 
 ### Fitting Pipeline
 
@@ -1229,8 +1250,4 @@ with tab_help:
 | **4 — Classification** | Curve type inferred from detected features |
 | **5 — Global polish** | Physics-informed p₀ → DE (light) → L-BFGS-B (Powell if needed) |
 | **6 — AICc selection** | Multiple candidate models compared; parsimony-penalised |
-
-### Notes
-- i\_corr shown in figures/exports is the Tafel intersection of the local anodic and cathodic regressions (if both present). Toggle this in the sidebar if you prefer the global model's i\_corr.
-- To make the cathodic linear window longer/closer to E\_corr, reduce the cathodic guard or relax the curvature threshold inside `fit_cathodic` (see comments).
 """)
