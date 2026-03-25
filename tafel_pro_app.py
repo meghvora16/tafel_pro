@@ -1,3 +1,4 @@
+# app.py
 """
 Polarization Curve Fitter — Publication-Grade Streamlit App
 (robust local Tafel overlays + Tafel intersection i_corr)
@@ -574,7 +575,7 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
                 show_regions=True, dpi=150):
     Ecorr_fit = float(best_p[0])
 
-    ba, bc = max(float(best_p[2]), 1e-9), max(float(best_p[3]), 1e-9)
+    ba, bc = max(float(best_p[3-1+1]), 1e-9), max(float(best_p[3]), 1e-9)  # ba=p[2], bc=p[3]
     icorr_model = float(best_p[1])
 
     E_lo, E_hi = float(E.min()), float(E.max())
@@ -1022,7 +1023,8 @@ with tab_fit:
         sample_name = st.text_input("Sample label", "Sample 1")
 
     if uploaded_files:
-        for uf in uploaded_files:
+        # IMPORTANT: use index-based widget keys to avoid NameError from uf.name scopes
+        for idx, uf in enumerate(uploaded_files):
             st.markdown(f"---\n#### 📄 `{uf.name}`")
             with st.container():
 
@@ -1045,11 +1047,11 @@ with tab_fit:
                 with cc1:
                     e_sel = st.selectbox(f"E column [{uf.name}]", num_cols,
                         index=num_cols.index(ec_auto) if auto_ok and ec_auto in num_cols else 0,
-                        key=f"ec_{uf.name}")
+                        key=f"ec_{idx}")
                 with cc2:
                     i_sel = st.selectbox(f"i column [{uf.name}]", num_cols,
                         index=num_cols.index(ic_auto) if auto_ok and ic_auto in num_cols else min(1,len(num_cols)-1),
-                        key=f"ic_{uf.name}")
+                        key=f"ic_{idx}")
 
                 # Build arrays
                 E_raw = df_raw[e_sel].values.astype(float)
@@ -1090,7 +1092,7 @@ with tab_fit:
 
                 # ── FIT BUTTON ──────────────────────────────────────────────
                 if st.button(f"🚀 Run Full Pipeline · {uf.name}",
-                             key=f"btn_{uf.name}", type="primary",
+                             key=f"btn_{idx}", type="primary",
                              use_container_width=True):
                     import time; t0 = time.time()
 
