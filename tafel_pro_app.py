@@ -1,14 +1,10 @@
 """
-Polarization Curve Fitter — Publication-Grade Streamlit App
-============================================================
-Architecture (inspired by TAFEL-PRO v2.1):
-  Stage 1 – Detect E_corr from interpolated zero-crossing
-  Stage 2 – Fit cathodic branch independently (sliding-window Tafel + diffusion limit)
-  Stage 3 – Fit anodic branch independently (sliding-window Tafel + passive + transpassive)
-  Stage 4 – Classify curve type (A / AD / P / PT / Full)
-  Stage 5 – Assemble physics-informed p0 → DE + L-BFGS-B + Nelder-Mead global polish
-  Stage 6 – AICc model selection
-  Stage 7 – Publication figure + Excel + PDF export
+Polarization Curve Fitter — Publication-Grade Streamlit App (Optimized)
+========================================================================
+Key updates:
+- Vectorized sliding-window regressions for Tafel branch detection (fast & robust)
+- Adaptive dense sampling, rasterized scatters, and optional downsampling for faster plotting
+- Lighter, early-exit global optimization with fewer stages where possible
 """
 
 import streamlit as st
@@ -17,10 +13,9 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 from matplotlib.gridspec import GridSpec
 from matplotlib.ticker import AutoMinorLocator
-import io, os, zipfile, warnings, traceback, re
+import io, zipfile, warnings, traceback, re
 from itertools import groupby
 from scipy.optimize import differential_evolution, minimize
 from scipy.signal import savgol_filter, find_peaks
@@ -59,7 +54,7 @@ PALETTE = ["#2e86de","#e84393","#27ae60","#e67e22","#8e44ad","#16a085","#c0392b"
 
 REGION_COLORS = {
     "cathodic":     ("#6baed6", 0.14),
-    "active":       ("#fd8d3c", 0.22),   # brighter — active region is narrow, needs visibility
+    "active":       ("#fd8d3c", 0.22),
     "passive":      ("#74c476", 0.16),
     "transpassive": ("#9e9ac8", 0.18),
 }
@@ -86,8 +81,7 @@ def slog(x):
 def sig(x, k=40.0):
     """Numerically stable logistic sigmoid."""
     xk = np.clip(k * x, -60, 60)
-    return np.where(xk >= 0,
-                    1.0 / (1.0 + np.exp(-xk)),
+    return np.where(xk >= 0, 1.0 / (1.0 + np.exp(-xk)),
                     np.exp(xk) / (1.0 + np.exp(xk)))
 
 def sm(y, w=11, p=3):
@@ -96,7 +90,7 @@ def sm(y, w=11, p=3):
     w = min(w, n if n % 2 == 1 else n - 1)
     w = max(5, w) if w >= 5 else n
     if w > n or w < 5: return y.copy()
-    return savgol_filter(y, w, min(p, w - 1))
+    return savgol_filter(y, w, min(p, w - 1), mode="interp")
 
 def r2_score(yt, yp):
     sr = np.sum((yt - yp) ** 2)
@@ -107,6 +101,82 @@ def aicc(n, k, sse):
     """Corrected AIC."""
     if n <= k + 1 or sse <= 0: return 1e30
     return n * np.log(sse / n) + 2 * k + (2 * k * (k + 1)) / max(n - k - 1, 1)
+
+def downsample_uniform(x, y, max_pts=400):
+    """Simple uniform downsample to cap points for secondary panels."""
+    if len(x) <= max_pts:
+        return x, y
+    idx = np.linspace(0, len(x)-1, max_pts).astype(int)
+    return x[idx], y[idx]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FAST SLIDING REGRESSION (VECTORIZED)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _sliding_regress_full(x, y, min_len=4, max_len=25):
+    """
+    Vectorized sliding-window linear regression on (x,y) sorted by x.
+    Returns concatenated arrays: start_idx, end_idx (exclusive), slope, intercept, r2.
+    """
+    n = len(x)
+    if n < min_len:
+        return (np.array([], int), np.array([], int),
+                np.array([]), np.array([]), np.array([]))
+    Sx  = np.cumsum(x)
+    Sy  = np.cumsum(y)
+    Sxx = np.cumsum(x*x)
+    Sxy = np.cumsum(x*y)
+    Syy = np.cumsum(y*y)
+
+    starts_all = []
+    ends_all = []
+    slopes_all = []
+    inters_all = []
+    r2_all = []
+
+    wmax = min(max_len, n)
+    for w in range(min_len, wmax+1):
+        i0 = np.arange(0, n - w + 1)
+        i1 = i0 + w - 1
+        def segsum(csum):
+            return csum[i1] - np.concatenate(([0.0], csum[i0[:-1]]))
+        sum_x  = segsum(Sx)
+        sum_y  = segsum(Sy)
+        sum_xx = segsum(Sxx)
+        sum_xy = segsum(Sxy)
+        sum_yy = segsum(Syy)
+
+        w_f = float(w)
+        mx = sum_x / w_f
+        my = sum_y / w_f
+
+        denom = sum_xx - w_f * mx * mx
+        slope = np.where(np.abs(denom) > 1e-18, (sum_xy - w_f * mx * my) / denom, 0.0)
+        intercept = my - slope * mx
+
+        # SSE via sums
+        SSE = (sum_yy
+               - 2.0*intercept*sum_y
+               - 2.0*slope*sum_xy
+               + (intercept*intercept)*w_f
+               + 2.0*intercept*slope*sum_x
+               + (slope*slope)*sum_xx)
+        SST = sum_yy - w_f * my * my
+        R2 = np.where(SST > 1e-18, 1.0 - SSE / SST, 0.0)
+        R2 = np.clip(R2, 0.0, 1.0)
+
+        starts_all.append(i0)
+        ends_all.append(i1 + 1)
+        slopes_all.append(slope)
+        inters_all.append(intercept)
+        r2_all.append(R2)
+
+    starts = np.concatenate(starts_all) if starts_all else np.array([], int)
+    ends   = np.concatenate(ends_all) if ends_all else np.array([], int)
+    slopes = np.concatenate(slopes_all) if slopes_all else np.array([])
+    inters = np.concatenate(inters_all) if inters_all else np.array([])
+    r2s    = np.concatenate(r2_all) if r2_all else np.array([])
+    return starts, ends, slopes, inters, r2s
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CURVE TYPE REGISTRY
@@ -198,27 +268,16 @@ def pol_model(E, p, ct="PT"):
 
 def detect_ecorr(E, i):
     """
-    Robust Ecorr detection — always finds the TRUE corrosion potential.
-
-    Active-passive curves cross zero multiple times:
-      (1) True Ecorr: cathodic→anodic at the corrosion potential (lowest E)
-      (2) Repassivation: anodic→cathodic at the active peak
-      (3) Transpassive: cathodic→anodic again at high E
-
-    Fix: always pick the MOST CATHODIC (lowest E) cathodic→anodic crossing.
-    The first crossing [0] is wrong when repassivation creates an earlier crossing.
-    This matches the batch_tafel.py _robust_ecorr() logic.
+    Robust Ecorr detection — most cathodic cathodic→anodic crossing
+    with linear interpolation; fallback to minimum |i|.
     """
     E = np.asarray(E, float); i = np.asarray(i, float)
-    # Ensure sorted by E
     si = np.argsort(E); Es = E[si]; is_ = i[si]
-
     sc = np.where(np.diff(np.sign(is_)))[0]
     if len(sc) == 0:
         idx = int(np.argmin(np.abs(is_)))
         return float(Es[idx]), int(si[idx])
 
-    # Collect all crossings with interpolated E position
     crossings = []
     for k in sc:
         denom = is_[k+1] - is_[k]
@@ -231,176 +290,151 @@ def detect_ecorr(E, i):
         idx = int(np.argmin(np.abs(is_)))
         return float(Es[idx]), int(si[idx])
 
-    # True Ecorr = MOST CATHODIC cathodic→anodic crossing
     anodic = [(Ec, idx) for Ec, idx, ga in crossings if ga]
     if anodic:
-        return min(anodic, key=lambda x: x[0])   # lowest E wins
-
-    # Fallback: most cathodic crossing of any sign
+        return min(anodic, key=lambda x: x[0])
     best = min(crossings, key=lambda x: x[0])
     return best[0], best[1]
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 2 — CATHODIC BRANCH FIT
+# STAGE 2 — CATHODIC BRANCH FIT (FAST)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fit_cathodic(E, i, Ecorr):
     """
-    Sliding-window linear regression on log|i_cat| vs E.
-    KEY: prefer the window CLOSEST to Ecorr (true Tafel region, least IR/conc effects).
-    Scoring: R2 * closeness_weight, NOT pure R2.
-    Returns: bc, icorr, iL, has_diffusion
+    Vectorized sliding regression on log|i| vs E for cathodic branch.
+    Scores windows by R2 × proximity to Ecorr; returns bc, icorr, iL, has_diff.
     """
     cat = i < 0
     if np.sum(cat) < 4:
         return dict(bc=0.120, icorr=1e-8, iL=1e-2, has_diff=False, r2=0.0)
 
-    Ec  = E[cat]; lgi = slog(i[cat])
+    Ec  = E[cat]; lgi = np.log10(np.maximum(np.abs(i[cat]), TINY))
     si  = np.argsort(Ec); Ec, lgi = Ec[si], lgi[si]
 
-    # ── Sliding-window: score = R2 x closeness-to-Ecorr ──
-    # Exclude points within 20 mV of Ecorr (near zero-crossing, not Tafel)
-    TAFEL_GUARD = 0.020   # V — minimum distance from Ecorr
-    valid = Ec < (Ecorr - TAFEL_GUARD)
-    Ec_v  = Ec[valid]; lgi_v = lgi[valid]
+    # Guard near Ecorr
+    TAFEL_GUARD = 0.020
+    mask = Ec < (Ecorr - TAFEL_GUARD)
+    if np.sum(mask) < 4:
+        mask = np.ones_like(Ec, bool)
 
-    best_score, best_sl, best_b, best_r2 = 0.0, -8.0, -6.0, 0.0
-    mp = max(4, len(Ec_v) // 5)
-    for s0 in range(len(Ec_v) - mp + 1):
-        for s1 in range(s0 + mp, min(s0 + 25, len(Ec_v) + 1)):
-            try:
-                sl, b, r, *_ = linregress(Ec_v[s0:s1], lgi_v[s0:s1])
-                if sl < 0 and r**2 > 0.90 and 0.020 < abs(1/sl) < 0.350:
-                    # Windows ending closer to Ecorr (but outside guard) are preferred
-                    dist = abs(Ec_v[s1-1] - Ecorr)
-                    closeness = np.exp(-dist / 0.20)
-                    score = r**2 * closeness
-                    if score > best_score:
-                        best_score, best_sl, best_b, best_r2 = score, sl, b, r**2
-            except:
-                continue
+    Ex = Ec[mask]; Yx = lgi[mask]
+    s_idx, e_idx, slope, intercept, R2 = _sliding_regress_full(Ex, Yx, min_len=4, max_len=25)
+    if len(slope) == 0:
+        sl, b, r2_best = -3.0, -8.0, 0.0
+    else:
+        invm = np.where(np.abs(slope) > 1e-12, 1.0/np.abs(slope), np.inf)
+        ok   = (slope < 0) & (invm > 0.02) & (invm < 0.35) & (R2 > 0.90)
+        if not np.any(ok):
+            ok = np.ones_like(R2, bool)
 
-    if abs(best_sl) < 0.5:
-        try:
-            best_sl, best_b, r, *_ = linregress(Ec_v if len(Ec_v)>3 else Ec, lgi_v if len(Ec_v)>3 else lgi)
-            best_r2 = r**2
-        except:
-            best_sl, best_b, best_r2 = -3.0, -4.0, 0.0
+        # Prefer windows ending closest to Ecorr
+        E_end = Ex[e_idx - 1]
+        clos  = np.exp(-np.abs(E_end - Ecorr)/0.20)
+        score = R2 * clos
+        score[~ok] *= 0.2
 
-    bc    = min(abs(1.0 / best_sl), 0.400) if abs(best_sl) > 0.5 else 0.120
+        k_best = int(np.argmax(score))
+        sl, b, r2_best = float(slope[k_best]), float(intercept[k_best]), float(R2[k_best])
 
-    # icorr: interpolate from Tafel extrapolation, but also consider |i| near Ecorr
-    icorr_tafel = float(10 ** (best_b + best_sl * Ecorr)) if abs(best_sl) > 0.5 else 1e-12
-    # Also estimate from smallest absolute current near sign-change
-    near_ec  = np.abs(Ec - Ecorr) < 0.050
-    if np.any(near_ec):
-        icorr_near = float(np.percentile(np.abs(i[cat][si][near_ec[:len(i[cat])]
-                                                            if len(near_ec)==len(i[cat])
-                                                            else near_ec]), 10))
+    bc = min(abs(1.0 / sl), 0.400) if abs(sl) > 1e-6 else 0.120
+    icorr_tafel = float(10 ** (b + sl * Ecorr)) if abs(sl) > 1e-6 else 1e-12
+
+    # Robust icorr using near-Ecorr window
+    near = np.abs(Ec - Ecorr) < 0.050
+    if np.any(near):
+        icorr_near = float(np.percentile(np.abs(i[cat][si][near]), 10))
     else:
         icorr_near = icorr_tafel
-    # Use the smaller of the two (conservative — avoids overestimating on passive materials)
     icorr = max(min(icorr_tafel, icorr_near * 10), 1e-15)
 
-    # ── Diffusion limit ──
-    iL     = None; has_diff = False
+    # Diffusion limit detection (light smoothing)
+    iL, has_diff = None, False
     if len(Ec) > 8:
-        lgi_sm  = sm(lgi, min(9, (len(Ec) // 2) * 2 - 1))
+        lgi_sm  = savgol_filter(lgi, max(5, min(9, len(Ec)//2*2-1)), 3, mode="interp")
         dlg     = np.abs(np.gradient(lgi_sm, Ec))
         flat    = dlg < max(np.percentile(dlg, 30), 0.5)
-        runs    = [(k, list(g)) for k, g in groupby(enumerate(flat),
-                   key=lambda x: x[1]) if k]
+        runs    = [(k, list(g)) for k, g in groupby(enumerate(flat), key=lambda x: x[1]) if k]
         if runs:
-            best_run = max(runs, key=lambda x: len(x[1]))
-            idxs     = [s[0] for s in best_run[1]]
+            idxs = [s[0] for s in max(runs, key=lambda x: len(x[1]))[1]]
             if len(idxs) >= 3 and abs(Ec[idxs[-1]] - Ec[idxs[0]]) > 0.03:
-                iL       = float(np.median(np.abs(i[cat][si][idxs])))
+                iL = float(np.median(np.abs(i[cat][si][idxs])))
                 has_diff = True
     if iL is None:
         iL = icorr * 1e4
 
     return dict(bc=bc, icorr=icorr, iL=iL, has_diff=has_diff,
-                r2=best_r2, E_cat=Ec, lgi_cat=lgi)
+                r2=r2_best, E_cat=Ec, lgi_cat=lgi)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 3 — ANODIC BRANCH FIT
+# STAGE 3 — ANODIC BRANCH FIT (FAST)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fit_anodic(E, i, Ecorr):
     """
-    Sliding-window Tafel fit for active region, then detect passive/transpassive.
-    Returns: ba, has_passive, Epass, ip, has_trans, Etrans
+    Vectorized sliding regression for anodic active Tafel; passive/transpassive detection.
     """
     ano = i > 0
     if np.sum(ano) < 4:
         return dict(ba=0.060, has_passive=False, Epass=None, ip=1e-6,
                     has_trans=False, Etrans=None, r2=0.0)
 
-    Ea  = E[ano]; lgia = slog(i[ano])
+    Ea  = E[ano]; lgia = np.log10(np.maximum(np.abs(i[ano]), TINY))
     si  = np.argsort(Ea); Ea, lgia = Ea[si], lgia[si]
 
-    # ── Best active Tafel window (near Ecorr, prefer closest window) ──
-    TAFEL_GUARD_A = 0.010   # V — start 10 mV above Ecorr
-    valid_a = Ea > (Ecorr + TAFEL_GUARD_A)
-    Ea_v    = Ea[valid_a]; lgia_v = lgia[valid_a]
+    TAFEL_GUARD_A = 0.010
+    mask = Ea > (Ecorr + TAFEL_GUARD_A)
+    if np.sum(mask) < 4:
+        mask = np.ones_like(Ea, bool)
 
-    best_score_a, best_sl = 0.0, 25.0   # default 40 mV/dec = slope 25
-    mp = max(3, len(Ea_v) // 6)
-    for s0 in range(len(Ea_v) - mp + 1):
-        for s1 in range(s0 + mp, min(s0 + 20, len(Ea_v) + 1)):
-            try:
-                sl, b, r, *_ = linregress(Ea_v[s0:s1], lgia_v[s0:s1])
-                if sl > 0 and r**2 > 0.85 and 0.010 < abs(1/sl) < 0.400:
-                    # Prefer windows starting closest to Ecorr
-                    dist  = abs(Ea_v[s0] - Ecorr)
-                    score = r**2 * np.exp(-dist / 0.10)
-                    if score > best_score_a:
-                        best_score_a, best_sl = score, sl
-            except:
-                continue
+    Ex = Ea[mask]; Yx = lgia[mask]
+    s_idx, e_idx, slope, intercept, R2 = _sliding_regress_full(Ex, Yx, min_len=3, max_len=20)
+    if len(slope) == 0:
+        sl, r2_best = 25.0, 0.0
+    else:
+        invm = np.where(np.abs(slope) > 1e-12, 1.0/np.abs(slope), np.inf)
+        ok   = (slope > 0) & (invm > 0.01) & (invm < 0.40) & (R2 > 0.85)
+        if not np.any(ok):
+            ok = np.ones_like(R2, bool)
 
-    ba = min(abs(1.0 / best_sl), 0.250) if abs(best_sl) > 2.0 else 0.040
+        E_start = Ex[s_idx]
+        clos    = np.exp(-np.abs(E_start - Ecorr)/0.10)
+        score   = R2 * clos
+        score[~ok] *= 0.2
 
-    # ── Active peak detection ──
-    # Find local maximum in anodic current (marks active→passive transition)
+        k_best  = int(np.argmax(score))
+        sl, r2_best = float(slope[k_best]), float(R2[k_best])
+
+    ba = min(abs(1.0 / sl), 0.250) if abs(sl) > 1e-6 else 0.040
+
+    # Active peak detection
     Epeak_detected = None
     if len(Ea) > 4:
         pks, _ = find_peaks(lgia, prominence=0.3, distance=2)
         if len(pks) > 0:
-            # Take the peak nearest to Ecorr on the anodic side
-            pk = pks[int(np.argmin(np.abs(Ea[pks] - Ecorr)))]
-            Epeak_detected = float(Ea[pk])
+            pk = int(np.argmin(np.abs(Ea[pks] - Ecorr)))
+            Epeak_detected = float(Ea[pks[pk]])
 
-    # ── Passive plateau: flat region in log|i| vs E ──
+    # Passive / Transpassive detection
     has_passive = False; Epass = None; ip = 1e-6
     has_trans   = False; Etrans = None
-
     if len(Ea) > 8:
-        lgia_sm = sm(lgia, min(11, (len(Ea) // 2) * 2 - 1))
+        lgia_sm = savgol_filter(lgia, max(5, min(11, len(Ea)//2*2-1)), 3, mode="interp")
         dlg     = np.gradient(lgia_sm, Ea)
         adlg    = np.abs(dlg)
-
-        # Flat = |d log i / dE| < threshold
         thr  = max(np.percentile(adlg, 30), 0.8)
         flat = adlg < thr
 
-        runs = [(k, list(g)) for k, g in groupby(enumerate(flat),
-                key=lambda x: x[1]) if k]
+        runs = [(k, list(g)) for k, g in groupby(enumerate(flat), key=lambda x: x[1]) if k]
         for _, ri in runs:
             idxs = [s[0] for s in ri]
             span = abs(Ea[idxs[-1]] - Ea[idxs[0]])
             if len(idxs) >= 4 and span > 0.06:
-                pre_mask = Ea < Ea[idxs[0]]
-                if np.sum(pre_mask) < 1:
-                    continue
                 ip_cand = float(np.median(np.abs(i[ano][si][idxs])))
-                # Confirm passive: current must be < peak current (drop from active)
                 if ip_cand < float(np.max(np.abs(i[ano]))) * 0.7:
                     has_passive = True
                     Epass       = float(Ea[idxs[0]])
                     ip          = ip_cand
-
-                    # Transpassive: rising current after passive end
                     post = Ea > Ea[idxs[-1]]
                     if np.sum(post) > 3:
                         post_dlg = dlg[np.where(post)[0]]
@@ -412,9 +446,8 @@ def fit_anodic(E, i, Ecorr):
                     break
 
     return dict(ba=ba, has_passive=has_passive, Epass=Epass, ip=ip,
-                has_trans=has_trans, Etrans=Etrans,
-                Epeak=Epeak_detected,
-                r2=float(best_score_a), E_an=Ea, lgi_an=lgia)
+                has_trans=has_trans, Etrans=Etrans, Epeak=Epeak_detected,
+                r2=float(r2_best), E_an=Ea, lgi_an=lgia)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STAGE 4 — CLASSIFY CURVE TYPE
@@ -430,23 +463,17 @@ def classify_curve(cat_res, an_res):
     return CT.A
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 5 — ASSEMBLE P0 & GLOBAL POLISH
+# STAGE 5 — ASSEMBLE P0 & GLOBAL POLISH (LEANER)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _make_p0(Ecorr, cat, an, ct, E_max):
-    """
-    Build physics-informed initial parameter vector.
-    Uses active PEAK position for Epass p0 when available.
-    """
     ic  = cat["icorr"]
     bc  = cat["bc"]
     ba  = an["ba"]
     iL  = cat["iL"]
 
-    # Epass p0: prefer active peak position (sharp passivation materials)
-    # then flat-region start, then fallback
     if an.get("Epeak") is not None:
-        Ep = an["Epeak"]          # active peak = passivation onset for sharp transitions
+        Ep = an["Epeak"]
     elif an["has_passive"] and an["Epass"] is not None:
         Ep = an["Epass"]
     else:
@@ -457,35 +484,22 @@ def _make_p0(Ecorr, cat, an, ct, E_max):
     Et = an["Etrans"] if an["has_trans"] else E_max + 5.0
     it = ip * 0.5    if an["has_trans"] else ic * 0.001
 
-    # kpass: use small value for sharp transitions (passive alloys),
-    # scale with how steep the active-to-passive drop is
-    kpass_p0 = 0.010  # default: fairly sharp
-
-    return np.array([
-        Ecorr, ic, ba, bc,
-        Ep, kpass_p0, ip,
-        Et, 0.015, it,
-        iL,
-    ])
+    kpass_p0 = 0.010
+    return np.array([Ecorr, ic, ba, bc, Ep, kpass_p0, ip, Et, 0.015, it, iL])
 
 def _build_bounds(Ecorr, cat, an, ct, E_min, E_max, E_span):
     ic   = max(cat["icorr"], 1e-14)
     iL   = max(cat["iL"],    1e-10)
-
-    # Tafel slope bounds: ±3× around branch-fit, clamped to physical range.
-    # Wide enough for DE to find the true minimum even if branch fit is off.
     ba_fit = float(an["ba"])
     bc_fit = float(cat["bc"])
-    ba_lo  = max(ba_fit * 0.30, 0.010)
-    ba_hi  = min(ba_fit * 3.00, 0.250)
-    bc_lo  = max(bc_fit * 0.30, 0.010)
-    bc_hi  = min(bc_fit * 3.00, 0.400)
+    ba_lo  = max(ba_fit * 0.30, 0.010); ba_hi  = min(ba_fit * 3.00, 0.250)
+    bc_lo  = max(bc_fit * 0.30, 0.010); bc_hi  = min(bc_fit * 3.00, 0.400)
 
     lo = np.array([
         E_min,                  # Ecorr
         max(ic * 1e-5, 1e-15),  # icorr
-        ba_lo,                  # ba — anchored to branch fit
-        bc_lo,                  # bc — anchored to branch fit
+        ba_lo,                  # ba
+        bc_lo,                  # bc
         Ecorr + 0.005,          # Epass
         0.002,                  # k_pass
         max(ic * 1e-6, 1e-16),  # ip
@@ -497,8 +511,8 @@ def _build_bounds(Ecorr, cat, an, ct, E_min, E_max, E_span):
     hi = np.array([
         E_max,
         min(ic * 1e6, 1.0),
-        ba_hi,                  # ba — anchored to branch fit
-        bc_hi,                  # bc — anchored to branch fit
+        ba_hi,
+        bc_hi,
         E_max,
         0.120,
         min(ic * 1e5, 1.0),
@@ -507,11 +521,10 @@ def _build_bounds(Ecorr, cat, an, ct, E_min, E_max, E_span):
         min(ic * 1e7, 10.0),
         min(iL * 1000, 1.0),
     ])
-    # Clip p0 to bounds
     lo = np.minimum(lo, hi - 1e-12)
     return lo, hi
 
-LOG_IDX = {1, 6, 9, 10}   # indices fitted in log-space
+LOG_IDX = {1, 6, 9, 10}
 
 def _pack(p, fidx):
     return np.array([np.log10(max(p[j], TINY)) if j in LOG_IDX else p[j]
@@ -533,30 +546,23 @@ def _pbounds(lo, hi, fidx):
 
 def global_polish(E, i, p0, ct, lo, hi):
     """
-    5-stage optimization (DE → L-BFGS-B → Nelder-Mead → Powell → SLSQP).
-    Inspired by batch_tafel.py approach.
-
-    Weighting: 8× weight within ±150 mV of Ecorr (Tafel region) so ba, bc,
-    icorr are anchored to the linear slopes, not the passive plateau which
-    has many more data points.
+    Leaner 3-stage optimization with early exit:
+    DE (lighter) → L-BFGS-B; if needed Powell.
+    Weighted error near Ecorr.
     """
-    ld    = slog(i)
+    ld    = np.log10(np.maximum(np.abs(i), TINY))
     fidx  = CT.idx(ct)
     bnds  = _pbounds(lo, hi, fidx)
     n, nf = len(E), len(fidx)
 
-    # Tafel-zone weighting: strong weight near Ecorr
     Ecorr_p0 = float(p0[0])
     w_base   = 1.0 + 7.0 * np.exp(-np.abs(E - Ecorr_p0) / 0.120)
-    w_base   = w_base / w_base.mean()
+    w_base  /= w_base.mean()
 
     def obj(x):
         p = _unpack(x, fidx, p0.copy(), lo, hi)
-        try:
-            pred = pol_model(E, p, ct)
-            return float(np.sum(w_base * (ld - slog(pred)) ** 2))
-        except:
-            return 1e30
+        pred = pol_model(E, p, ct)
+        return float(np.sum(w_base * (ld - np.log10(np.maximum(np.abs(pred), TINY))) ** 2))
 
     best_x   = _pack(p0, fidx)
     best_val = obj(best_x)
@@ -564,62 +570,50 @@ def global_polish(E, i, p0, ct, lo, hi):
     def update(x):
         nonlocal best_x, best_val
         v = obj(x)
-        if v < best_val:
+        if v < best_val - 1e-12:
             best_x, best_val = x.copy(), v
+        return v
 
-    # Stage 1: DE — aggressive global search
+    # Stage 1: Differential Evolution (lighter config)
     try:
-        ps  = max(15, min(20, nf * 3))
-        mi  = max(300, min(800, nf * 60))
-        res = differential_evolution(obj, bnds, seed=42, maxiter=mi, popsize=ps,
-                                     tol=1e-14, mutation=(0.5, 1.9),
-                                     recombination=0.9, polish=False, workers=1,
-                                     strategy="best1bin")
+        ps  = max(12, min(16, nf * 3))
+        mi  = max(150, min(400, nf * 50))
+        res = differential_evolution(
+            obj, bnds, seed=42, maxiter=mi, popsize=ps,
+            tol=1e-9, mutation=(0.5, 1.7), recombination=0.85,
+            polish=False, workers=1, strategy="best1bin"
+        )
         update(res.x)
-    except:
+    except Exception:
         pass
 
-    # Stage 2: L-BFGS-B
+    # Stage 2: L-BFGS-B (main polish)
     try:
         r = minimize(obj, best_x, method="L-BFGS-B", bounds=bnds,
-                     options={"maxiter": 30000, "ftol": 1e-16, "gtol": 1e-14})
+                     options={"maxiter": 15000, "ftol": 1e-12, "gtol": 1e-10})
         update(r.x)
-    except:
+    except Exception:
         pass
 
-    # Stage 3: Nelder-Mead
-    try:
-        r = minimize(obj, best_x, method="Nelder-Mead",
-                     options={"maxiter": 20000, "xatol": 1e-14,
-                              "fatol": 1e-16, "adaptive": True})
-        update(r.x)
-    except:
-        pass
-
-    # Stage 4: Powell — pattern search (good at escaping flat regions)
-    try:
-        r = minimize(obj, best_x, method="Powell",
-                     options={"maxiter": 15000, "xtol": 1e-14, "ftol": 1e-16})
-        update(r.x)
-    except:
-        pass
-
-    # Stage 5: SLSQP — final constrained polish
-    try:
-        r = minimize(obj, best_x, method="SLSQP", bounds=bnds,
-                     options={"maxiter": 10000, "ftol": 1e-16})
-        update(r.x)
-    except:
-        pass
+    # Early-exit if excellent
+    p_tmp = _unpack(best_x, fidx, p0.copy(), lo, hi)
+    pred  = pol_model(E, p_tmp, ct)
+    r2_now = r2_score(ld, np.log10(np.maximum(np.abs(pred), TINY)))
+    if r2_now < 0.995:
+        # Stage 3: Powell only if needed
+        try:
+            r = minimize(obj, best_x, method="Powell",
+                         options={"maxiter": 8000, "xtol": 1e-12, "ftol": 1e-12})
+            update(r.x)
+        except Exception:
+            pass
 
     best_p = _unpack(best_x, fidx, p0.copy(), lo, hi)
-
-    # Unweighted goodness of fit (for reporting)
-    pred  = pol_model(E, best_p, ct)
-    log_p = slog(pred)
-    sse   = float(np.sum((ld - log_p) ** 2))
-    r2    = r2_score(ld, log_p)
-    aic   = aicc(n, nf, sse)
+    pred   = pol_model(E, best_p, ct)
+    log_p  = np.log10(np.maximum(np.abs(pred), TINY))
+    sse    = float(np.sum((ld - log_p) ** 2))
+    r2     = r2_score(ld, log_p)
+    aic    = aicc(n, nf, sse)
 
     return best_p, r2, aic, sse
 
@@ -627,7 +621,6 @@ def global_polish(E, i, p0, ct, lo, hi):
 # DATA LOADING
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Column auto-detection signatures
 COL_SIG = [
     (r"we.*potential|ewe|potential/v|e/v|^e$|e \(v\)|e_v|^vf$",
      r"we.*current|<i>/ma|i/ma|current/a|i/a|^i$|i \(a\)|i_a|^im$",  "A"),
@@ -671,7 +664,7 @@ def load_file(uploaded):
     raise ValueError("Cannot parse file.")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PUBLICATION FIGURE
+# PUBLICATION FIGURE (ADAPTIVE & FAST)
 # ══════════════════════════════════════════════════════════════════════════════
 
 PLT_RC = {
@@ -691,20 +684,10 @@ PLT_RC = {
 def make_figure(E, i_obs, best_p, ct, sample_name,
                 cat_res, an_res, Ecorr, show_regions=True, dpi=150):
     """
-    Publication-quality 4-panel figure. X=E (V), Y=log10|i|.
-
-    Tafel lines strategy:
-      - Use the FITTED partial currents as Tafel lines (they naturally touch
-        the polarisation curve in the linear regions).
-      - Cathodic line: plotted over the FULL E range but only visible where
-        log(i_cat) >= y_lo (full cathodic arm shown, nothing cut).
-      - Anodic line: plotted from Ecorr to Epass only (active region), not
-        into the passive plateau where it becomes meaningless.
-      - Y-axis: full data range with no percentile clipping.
+    Publication-quality 4-panel figure. X=E (V), Y=log10|i| with adaptive dense sampling,
+    rasterized scatters, and robust y-limits.
     """
-    # Always use the FITTED Ecorr (best_p[0]) for Tafel line anchoring.
-    # The `Ecorr` argument (from detect_ecorr) is only used as a fallback label.
-    Ecorr = float(best_p[0])   # override with fitted value
+    Ecorr = float(best_p[0])   # use fitted Ecorr
 
     ba    = max(float(best_p[2]), 1e-9)
     bc    = max(float(best_p[3]), 1e-9)
@@ -712,61 +695,50 @@ def make_figure(E, i_obs, best_p, ct, sample_name,
     logIc = float(np.log10(max(icorr, TINY)))
 
     E_lo, E_hi = float(E.min()), float(E.max())
-    E_dense    = np.linspace(E_lo, E_hi, 5000)
+    span = max(E_hi - E_lo, 1e-6)
+    n_dense = int(np.clip(200 * span, 800, 2500))
+    E_dense = np.linspace(E_lo, E_hi, n_dense)
+
     i_dense    = pol_model(E_dense, best_p, ct)
     i_fit_E    = pol_model(E, best_p, ct)
-    log_obs    = slog(i_obs)
-    log_den    = slog(i_dense)
-    log_fitE   = slog(i_fit_E)
+    log_obs    = np.log10(np.maximum(np.abs(i_obs), TINY))
+    log_den    = np.log10(np.maximum(np.abs(i_dense), TINY))
+    log_fitE   = np.log10(np.maximum(np.abs(i_fit_E), TINY))
     residuals  = log_obs - log_fitE
     r2v  = r2_score(log_obs, log_fitE)
     rmse = float(np.sqrt(np.mean(residuals**2)))
 
-    # ── Y-axis limits ────────────────────────────────────────────────────────
-    # y_lo = full cathodic arm (data minimum, nothing cut)
-    # y_hi = anchored to the ACTIVE PEAK of the data, not the transpassive tail.
-    #   For passive models: find the max log|i| in the active region
-    #   (Ecorr → Epass), then add 1.5 decades headroom. This shows the
-    #   active peak, both Tafel lines, and the top of the passive plateau
-    #   without the transpassive blowup compressing everything.
     fin  = log_obs[np.isfinite(log_obs)]
     y_lo = float(np.nanmin(fin)) - 0.2
 
     if ct in CT.PASS:
         Epass_4y = float(best_p[4])
-        # Max log|i| in the active region (data points only, not model)
         act_mask = (E >= Ecorr - 0.02) & (E <= Epass_4y + 0.05)
         if np.sum(act_mask) >= 2:
             log_act = slog(i_obs[act_mask])
             log_act = log_act[np.isfinite(log_act)]
             active_peak_log = float(np.max(log_act)) if len(log_act) > 0 else logIc
         else:
-            # Fall back: compute from fitted model
             active_peak_log = logIc + 2.303 * (Epass_4y - Ecorr) / ba
-        # y_hi = active peak + 1.5 decades (shows peak + passive plateau clearly)
-        # Also ensure passive plateau is visible (logIp + 2 decades)
         logIp_val = float(np.log10(max(float(best_p[6]), TINY)))
         y_hi = max(active_peak_log + 1.5, logIp_val + 2.0)
     else:
         y_hi = float(np.percentile(fin, 90)) + 1.0
 
-    # ── Partial current Tafel lines ───────────────────────────────────────────
+    # tighten upper limit to avoid extreme compression by outliers
+    y_hi = min(y_hi, float(np.percentile(fin, 99)) + 1.8)
+
+    # Partial current Tafel lines
     logI_cat = np.log10(np.clip(icorr * np.exp(2.303*(Ecorr-E_dense)/bc), TINY, None))
     logI_ano = np.log10(np.clip(icorr * np.exp(2.303*(E_dense-Ecorr)/ba), TINY, None))
 
-    # Cathodic: shown where within y-window, restricted to cathodic side
-    msk_cat = (logI_cat >= y_lo - 0.05) & (logI_cat <= y_hi + 0.05)             & (E_dense <= Ecorr + 0.005)
+    msk_cat = (logI_cat >= y_lo - 0.05) & (logI_cat <= y_hi + 0.05) & (E_dense <= Ecorr + 0.005)
 
-    # Anodic: shown where within y-window AND within ±1 decade of the
-    # fitted model curve (so the dashed line overlaps the actual curve).
-    # This prevents the Tafel extrapolation from shooting off-screen while
-    # still drawing the line through the actual linear Tafel region.
     if ct in CT.PASS:
         Epass_fit = float(best_p[4])
         msk_ano_E = (E_dense >= Ecorr) & (E_dense <= Epass_fit)
     else:
         msk_ano_E = E_dense >= Ecorr
-    # Only draw where anodic partial is within y-window
     msk_ano = msk_ano_E & (logI_ano >= y_lo - 0.05) & (logI_ano <= y_hi + 0.05)
 
     with plt.rc_context(PLT_RC):
@@ -779,7 +751,7 @@ def make_figure(E, i_obs, best_p, ct, sample_name,
         ax_lin = fig.add_subplot(gs[1, 1])
         ax_res = fig.add_subplot(gs[1, 2])
 
-        # ══ PANEL A ══════════════════════════════════════════════════════════
+        # ══ PANEL A — Evans Diagram ═══════════════════════════════════════════
         ax = ax_ev
 
         if show_regions:
@@ -800,24 +772,19 @@ def make_figure(E, i_obs, best_p, ct, sample_name,
                 if ct in CT.TRANS and Et < E_hi:
                     vband(Et, E_hi, "transpassive", "Transpassive / pitting")
 
-        # Experimental data
         ax.scatter(E, log_obs, s=12, color="#4a7fa8", alpha=0.60,
-                   zorder=2, label="Experimental data", linewidths=0)
-
-        # Fitted model
-        ax.plot(E_dense, log_den, color="#1a3a5c", lw=2.3, zorder=5,
+                   zorder=2, label="Experimental data", linewidths=0, rasterized=True)
+        ax.plot(E_dense, log_den, color="#1a3a5c", lw=2.0, zorder=5,
                 label=f"Global fit  (R\u00b2={r2v:.5f})")
 
-        # Cathodic Tafel line — spans cathodic branch, overlaps data there
         if msk_cat.any():
             ax.plot(E_dense[msk_cat], logI_cat[msk_cat],
-                    "--", color="#8e44ad", lw=2.5, zorder=6,
+                    "--", color="#8e44ad", lw=2.2, zorder=6,
                     label=f"\u03b2c = {bc*1000:.0f} mV/dec")
 
-        # Anodic Tafel line — active region only
         if msk_ano.any():
             ax.plot(E_dense[msk_ano], logI_ano[msk_ano],
-                    "--", color="#e67e22", lw=2.5, zorder=6,
+                    "--", color="#e67e22", lw=2.2, zorder=6,
                     label=f"\u03b2a = {ba*1000:.0f} mV/dec")
 
         # Crossing point + drop-lines
@@ -865,25 +832,26 @@ def make_figure(E, i_obs, best_p, ct, sample_name,
                 bbox=dict(fc="white", ec=r2c, alpha=0.88, pad=3,
                           boxstyle="round,pad=0.3"))
 
-        # ══ PANEL B — Branch fits ═════════════════════════════════════════════
+        # ══ PANEL B — Branch Fits ═════════════════════════════════════════════
         ax = ax_br
-        ax.scatter(E, log_obs, s=5, color="#aab4c4", alpha=0.28, zorder=1, linewidths=0)
+        E_ds, log_obs_ds = downsample_uniform(E, log_obs, 400)
+        ax.scatter(E_ds, log_obs_ds, s=5, color="#aab4c4", alpha=0.28, zorder=1, linewidths=0, rasterized=True)
         if "E_cat" in cat_res:
             ax.scatter(cat_res["E_cat"], cat_res["lgi_cat"],
                        s=18, color="#6baed6", alpha=0.80, zorder=3,
-                       label="Cathodic data", linewidths=0)
+                       label="Cathodic data", linewidths=0, rasterized=True)
             msk_c_br = msk_cat & (E_dense <= Ecorr)
             if msk_c_br.any():
                 ax.plot(E_dense[msk_c_br], logI_cat[msk_c_br],
-                        "--", color="#3182bd", lw=1.8, zorder=4,
+                        "--", color="#3182bd", lw=1.6, zorder=4,
                         label=f"\u03b2c={bc*1000:.0f} mV/dec")
         if "E_an" in an_res:
             ax.scatter(an_res["E_an"], an_res["lgi_an"],
                        s=18, color="#fd8d3c", alpha=0.80, zorder=3,
-                       label="Anodic data", linewidths=0)
+                       label="Anodic data", linewidths=0, rasterized=True)
             if msk_ano.any():
                 ax.plot(E_dense[msk_ano], logI_ano[msk_ano],
-                        "--", color="#e6550d", lw=1.8, zorder=4,
+                        "--", color="#e6550d", lw=1.6, zorder=4,
                         label=f"\u03b2a={ba*1000:.0f} mV/dec")
             if an_res["has_passive"] and an_res["Epass"] is not None:
                 ax.axvline(float(an_res["Epass"]), color="#27ae60",
@@ -911,10 +879,11 @@ def make_figure(E, i_obs, best_p, ct, sample_name,
             uscale, ulbl = 1e6,  "\u03bcA/cm\u00b2"
         else:
             uscale, ulbl = 1e3,  "mA/cm\u00b2"
-        ylim_lin = i_p95 * uscale * 1.20
+        ylim_lin = max(i_p95 * uscale * 1.20, 1e-12)
+        E_lin_ds, i_obs_lin_ds = downsample_uniform(E, i_obs, 800)
         i_fit_cl = np.clip(i_dense * uscale, -ylim_lin * 3, ylim_lin * 3)
-        ax.scatter(E, i_obs * uscale, s=9, color="#4a7fa8",
-                   alpha=0.65, zorder=2, label="Data", linewidths=0)
+        ax.scatter(E_lin_ds, i_obs_lin_ds * uscale, s=9, color="#4a7fa8",
+                   alpha=0.65, zorder=2, label="Data", linewidths=0, rasterized=True)
         ax.plot(E_dense, i_fit_cl, color="#1a3a5c", lw=2.0, zorder=5, label="Fit")
         ax.axhline(0, color="#888", lw=0.7, zorder=1)
         ax.axvline(Ecorr, color="#e84393", ls="--", lw=1.2, zorder=3)
@@ -929,9 +898,10 @@ def make_figure(E, i_obs, best_p, ct, sample_name,
         ax.grid(True, which="major", ls="--", alpha=0.4)
         ax.legend(fontsize=8)
 
-        # ══ PANEL D — Residuals ════════════════════════════════════════════════
+        # ══ PANEL D — Residuals ═══════════════════════════════════════════════
         ax = ax_res
-        ax.scatter(E, residuals, s=10, color="#2e86de", alpha=0.65, zorder=3, linewidths=0)
+        ax.fill_between([E_lo, E_hi], -0.1, 0.1, color="#e84393", alpha=0.07, zorder=1)
+        ax.scatter(E, residuals, s=10, color="#2e86de", alpha=0.65, zorder=3, linewidths=0, rasterized=True)
         ax.axhline(0,    color="#333",    lw=0.9, zorder=2)
         ax.axhline( 0.1, color="#e84393", ls=":", lw=1.0, alpha=0.7)
         ax.axhline(-0.1, color="#e84393", ls=":", lw=1.0, alpha=0.7, label="\u00b10.1 log")
@@ -950,12 +920,6 @@ def make_figure(E, i_obs, best_p, ct, sample_name,
                      fontweight="bold", color="#1a3a5c", y=0.98)
 
     return fig, r2v, rmse
-
-
-
-
-
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # EXPORT
@@ -1208,7 +1172,7 @@ with tab_fit:
                 with p2:
                     with plt.rc_context(PLT_RC):
                         fp, ap = plt.subplots(figsize=(6, 3.8))
-                        ap.scatter(E, slog(i), s=7, color="#5a7fa8", alpha=0.65)
+                        ap.scatter(E, slog(i), s=7, color="#5a7fa8", alpha=0.65, rasterized=True)
                         ap.set_xlabel("E (V)"); ap.set_ylabel("log|i|")
                         ap.set_title("Raw Data Preview", fontsize=10)
                         ap.grid(True, ls="--", alpha=0.4)
@@ -1227,9 +1191,11 @@ with tab_fit:
                     import time; t0 = time.time()
 
                     if smooth_pre:
-                        w = min(9, len(i)//2*2-1); i = savgol_filter(i, w, 3)
+                        w = min(9, len(i)//2*2-1)
+                        if w >= 5:
+                            i = savgol_filter(i, w, 3, mode="interp")
 
-                    # ── Pipeline progress (no expanders / status widgets) ──────
+                    # ── Pipeline progress ────────────────────────────────────
                     prog     = st.progress(0, text="Stage 1 — Detecting E_corr…")
                     log_area = st.empty()
                     log_lines = []
@@ -1266,18 +1232,28 @@ with tab_fit:
                     # Stage 5 — Global optimisation
                     E_lo = float(E.min()); E_hi = float(E.max()); E_sp = E_hi - E_lo
 
-                    # Always try multiple models and pick by AICc (like batch script)
-                    candidates = [ct_detected]
-                    if CT.A not in candidates:      candidates.append(CT.A)
-                    if CT.P not in candidates:      candidates.append(CT.P)   # always try passive
-                    if CT.PT not in candidates:     candidates.append(CT.PT)  # always try transpassive
+                    # Adaptive candidate set
                     if force_ct != "auto":
                         candidates = [force_ct]
+                    else:
+                        candidates = [ct_detected]
+                        if ct_detected in (CT.A, CT.AD):
+                            candidates += [CT.P]  # try passive if plausible
+                        if an_res["has_passive"]:
+                            candidates += [CT.P, CT.PT]
+                        if cat_res["has_diff"]:
+                            candidates += [CT.AD]
+                        # ensure uniqueness and valid order
+                        seen = set(); uniq = []
+                        for c in candidates:
+                            if c not in seen:
+                                uniq.append(c); seen.add(c)
+                        candidates = uniq
 
                     all_res = []
                     n_cand  = len(candidates)
                     for k_c, ct_try in enumerate(candidates):
-                        prog.progress(50 + int(40 * k_c / n_cand),
+                        prog.progress(50 + int(40 * k_c / max(n_cand,1)),
                                       text=f"Optimising: {CT.name(ct_try)}…")
                         p0 = _make_p0(Ecorr, cat_res, an_res, ct_try, E_hi)
                         lo, hi = _build_bounds(Ecorr, cat_res, an_res,
@@ -1366,7 +1342,6 @@ with tab_fit:
                     if best_ct in CT.TRANS:
                         mc2[4].metric("E_trans (V)",    f"{p[7]:.5f}")
 
-                    # Model comparison table
                     if len(all_res) > 1:
                         st.markdown("**🏆 Model Comparison (AICc)**")
                         cmp_rows = [{
@@ -1455,7 +1430,7 @@ with tab_cmp:
                 col = PALETTE[idx % len(PALETTE)]
                 p   = res["params"]; ct = res["ct"]
                 lbl = res.get("name", f"S{idx+1}")
-                E_pl = np.linspace(-1.5, 1.5, 3000)
+                E_pl = np.linspace(min(p[0]-1.5, -1.5), max(p[0]+1.5, 1.5), 3000)
                 try:
                     i_pl = pol_model(E_pl, p, ct)
                     axes[0].plot(E_pl, slog(i_pl), color=col, lw=2, label=lbl)
@@ -1494,10 +1469,10 @@ with tab_help:
 | Stage | What happens |
 |---|---|
 | **1 — E_corr detection** | Interpolated zero-crossing of signed current |
-| **2 — Cathodic fit** | Sliding-window linear regression on log\|i\| vs E; best Tafel region; diffusion limit detection |
-| **3 — Anodic fit** | Same for anodic; passive plateau via flat log\|i\| region; transpassive detection |
+| **2 — Cathodic fit** | Vectorized sliding regression on log\\|i\\| vs E; best Tafel region; diffusion limit detection |
+| **3 — Anodic fit** | Same for anodic; passive plateau via flat log\\|i\\| region; transpassive detection |
 | **4 — Classification** | Curve type inferred from detected features |
-| **5 — Global polish** | Physics-informed p₀ → DE → L-BFGS-B → Nelder-Mead |
+| **5 — Global polish** | Physics-informed p₀ → DE (light) → L-BFGS-B (Powell if needed) |
 | **6 — AICc selection** | Multiple candidate models compared; parsimony-penalised |
 
 ---
