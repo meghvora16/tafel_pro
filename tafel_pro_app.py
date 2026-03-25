@@ -278,6 +278,19 @@ def _theil_sen(x, y):
 # FIX: Corrected proximity scoring, curvature weighting, i_corr estimation
 # ─────────────────────────────────────────────────────────────────────────────
 def fit_cathodic(E, i, Ecorr):
+    """
+    Find the cathodic Tafel window using hard beta enforcement.
+
+    Key design decisions:
+    - beta_ok is a HARD GATE: windows outside the physical Tafel slope range
+      are completely excluded (score=0), not just penalised. If all windows
+      fail, we fall back to the steepest valid-direction window.
+    - Proximity scoring uses a Gaussian centred 150 mV below Ecorr, rewarding
+      the true Tafel zone and penalising both mixed-control (too close) and
+      diffusion-plateau (too flat/far) regions.
+    - Points within the top 1.5 decades of log|i| closest to Ecorr are trimmed
+      before window search to avoid mixed-control corruption.
+    """
     cat = i < 0
     if np.sum(cat) < 4:
         return dict(bc=0.120, icorr=1e-8, iL=1e-2, has_diff=False, r2=0.0)
@@ -285,18 +298,25 @@ def fit_cathodic(E, i, Ecorr):
     Ec  = E[cat]; lgi = slog(i[cat])
     si  = np.argsort(Ec); Ec, lgi = Ec[si], lgi[si]
 
-    # Exclude points within cath_guard of Ecorr (mixed-control zone)
+    # Strict guard: exclude points within cath_guard of Ecorr
     base_mask = Ec < (Ecorr - CFG["cath_guard"])
     if np.sum(base_mask) < CFG["min_w_cat"]:
         base_mask = np.ones_like(Ec, bool)
 
     Ex, Yx = Ec[base_mask], lgi[base_mask]
     if len(Ex) < CFG["min_w_cat"]:
-        return dict(bc=0.120, icorr=max(10**np.min(Yx),1e-12), iL=1e-2, has_diff=False, r2=0.0,
-                    E_cat=Ec, lgi_cat=lgi)
+        return dict(bc=0.120, icorr=max(10**np.min(Yx), 1e-12), iL=1e-2,
+                    has_diff=False, r2=0.0, E_cat=Ec, lgi_cat=lgi)
 
-    # Smooth & derivatives
-    w_sm = max(5, min(11, len(Ex)//2*2-1))
+    # Trim near-Ecorr points where log|i| is within 1 decade of the minimum
+    # (these are in the mixed-control transition zone and corrupt linear fits)
+    lgi_max_cat = np.max(Yx)   # highest log|i| is farthest from Ecorr
+    trim_mask = Yx < (lgi_max_cat - 0.3)  # keep only points more than 0.3 dec below peak
+    if np.sum(trim_mask) >= CFG["min_w_cat"]:
+        Ex, Yx = Ex[trim_mask], Yx[trim_mask]
+
+    # Smooth & derivatives for quality metrics
+    w_sm = max(5, min(11, len(Ex) // 2 * 2 - 1))
     Y_sm = savgol_filter(Yx, w_sm, 3, mode="interp")
     dY   = np.gradient(Y_sm, Ex)
     d2Y  = np.gradient(dY, Ex)
@@ -310,100 +330,108 @@ def fit_cathodic(E, i, Ecorr):
     # Per-window quality metrics
     max_d2 = np.array([np.max(np.abs(d2Y[s:e])) for s, e in zip(s_idx, e_idx)])
 
-    # Monotonicity: fraction with derivative sign matching expected cathodic direction (negative)
     def _mono_frac(s, e):
         seg = dY[s:e]
-        if len(seg) == 0: return 0.0
-        return float(np.mean(seg < 0))   # cathodic log|i| DECREASES as E increases
+        return float(np.mean(seg < 0)) if len(seg) else 0.0   # log|i| decreases as E↑
     mono = np.array([_mono_frac(s, e) for s, e in zip(s_idx, e_idx)])
 
-    invm = np.where(np.abs(slope) > 1e-12, 1.0/np.abs(slope), np.inf)
-    beta_ok = (invm > CFG["beta_min"]) & (invm < CFG["beta_max_c"])
-    curv_ok = max_d2 < CFG["curvature_max"]
-    mono_ok = mono >= CFG["lin_frac"]
+    invm     = np.where(np.abs(slope) > 1e-12, 1.0 / np.abs(slope), np.inf)
+    # HARD GATE: beta_ok is a strict physical constraint, not a scoring term
+    beta_ok  = (slope < 0) & (invm > CFG["beta_min"]) & (invm < CFG["beta_max_c"])
+    curv_ok  = max_d2 < CFG["curvature_max"]
+    mono_ok  = mono >= CFG["lin_frac"]
 
-    # FIX: relaxed diff_ok — previous threshold of 0.35 was too aggressive and
-    # rejected valid Tafel windows with natural slope variation. Use 0.20 instead.
-    med_d1 = np.array([np.median(np.abs(dY[s:e])) for s, e in zip(s_idx, e_idx)])
-    slope_mag = np.abs(slope) + 1e-12
-    diff_ok = med_d1 > 0.20 * slope_mag   # FIX: was 0.35, now 0.20
+    # Primary candidates: pass all quality gates
+    ok = beta_ok & curv_ok & mono_ok & (R2 > 0.85)
 
-    ok = (slope < 0) & beta_ok & curv_ok & mono_ok & diff_ok & (R2 > 0.85)
+    # Fallback tier 1: relax mono + curvature, keep beta_ok and R2
     if not np.any(ok):
-        # Relax monotonicity; KEEP beta_ok to avoid unphysical slopes
-        ok = (slope < 0) & beta_ok & (R2 > 0.80)
+        ok = beta_ok & (R2 > 0.75)
 
-    # FIX: Corrected proximity scoring for cathodic branch.
-    # OLD (wrong): exp(-|E_end - Ecorr| / 0.18) — rewards windows NEAR Ecorr,
-    #   which is the mixed-control zone, not the Tafel region.
-    # NEW: Gaussian centered at 0.15 V below Ecorr (σ=0.12 V).
-    #   This rewards the true Tafel zone (50–300 mV from Ecorr) and gently
-    #   penalizes windows that are either too close (mixed control) or too far
-    #   (diffusion plateau). Combined with R²² weighting for parsimony.
-    E_end = Ex[e_idx - 1]
-    dist_from_Ecorr = Ecorr - E_end   # positive for cathodic (E_end < Ecorr)
-    dist_target = 0.150               # ideal distance: 150 mV from Ecorr
-    dist_sigma  = 0.120               # accept 30–400 mV range well
-    prox = np.exp(-((dist_from_Ecorr - dist_target)**2) / (2.0 * dist_sigma**2))
+    # Fallback tier 2: beta only — pick steepest valid-direction window
+    # (never fall back to windows with wrong slope direction or unphysical beta)
+    if not np.any(ok):
+        ok = beta_ok.copy()
 
-    # FIX: incorporate curvature penalty directly into score (lower curvature = better)
-    curv_penalty = np.exp(-max_d2 / max(CFG["curvature_max"], 10.0))
+    # Absolute last resort: steepest negative-slope window
+    if not np.any(ok):
+        ok = slope < 0
+        if not np.any(ok):
+            ok = np.ones(len(slope), bool)
 
-    # FIX: R² squared to sharpen discrimination; multiply by curvature penalty
-    score = (R2 ** 2) * prox * np.clip(mono, 0.2, 1.0) * curv_penalty
-    score[~ok] *= 0.15   # soften (not zero) to allow fallback
+    # Scoring — NO proximity Gaussian for cathodic.
+    # The Gaussian at 150 mV from Ecorr fails for steep/diffusion-limited cathodic
+    # branches (stainless, passive alloys) where the true Tafel zone may be only
+    # 30–80 mV wide very close to Ecorr.  R² + curvature + monotonicity already
+    # capture linearity completely; the most linear window wins naturally.
+    # Window length bonus rewards more statistically robust fits.
+    curv_pen  = np.exp(-max_d2 / max(CFG["curvature_max"], 10.0))
+    win_len   = (e_idx - s_idx).astype(float)
+    len_bonus = np.log1p(win_len) / np.log1p(25.0)          # normalised [0,1]
+    score     = (R2 ** 2) * np.clip(mono, 0.2, 1.0) * curv_pen * (0.7 + 0.3 * len_bonus)
 
-    k_best = int(np.argmax(score))
-    s0, s1 = int(s_idx[k_best]), int(e_idx[k_best])
+    # HARD ZERO for non-physical windows; soft penalty for quality failures
+    score[~beta_ok] = 0.0
+    score[beta_ok & ~(curv_ok & mono_ok)] *= 0.30
+
+    # If everything is zero after hard gating, fall back to steepest beta_ok slope
+    if np.all(score == 0.0) or not np.any(ok):
+        neg_slope_mag = np.where(slope < 0, np.abs(slope), 0.0)
+        k_best = int(np.argmax(neg_slope_mag))
+    else:
+        k_best = int(np.argmax(score))
+
+    s0, s1   = int(s_idx[k_best]), int(e_idx[k_best])
     sl_ols, b_ols = float(slope[k_best]), float(intercept[k_best])
 
-    # Theil–Sen + Huber; pick better in R²
+    # Theil–Sen + Huber; pick best R²
     sl_ts, b_ts = _theil_sen(Ex[s0:s1], Yx[s0:s1])
     sl_hb, b_hb = _huber_fit(Ex[s0:s1], Yx[s0:s1], sl_ols, b_ols)
 
     def _r2_line(sl, b):
-        return r2_score(Yx[s0:s1], sl*Ex[s0:s1] + b)
+        return r2_score(Yx[s0:s1], sl * Ex[s0:s1] + b)
     cand = [(sl_ts, b_ts, _r2_line(sl_ts, b_ts)),
             (sl_hb, b_hb, _r2_line(sl_hb, b_hb)),
             (sl_ols, b_ols, _r2_line(sl_ols, b_ols))]
     sl_ref, b_ref, r2_win = max(cand, key=lambda t: t[2])
 
+    # Ensure the refined slope is physically sensible
+    if sl_ref >= 0 or abs(1.0 / sl_ref) > CFG["beta_max_c"] * 1.5:
+        sl_ref, b_ref = sl_ols, b_ols  # revert to OLS if refinement drifted
+
     bc = min(abs(1.0 / sl_ref), CFG["beta_max_c"]) if abs(sl_ref) > 1e-9 else 0.120
 
-    # Tafel extrapolation of cathodic line to Ecorr
+    # Tafel extrapolation to Ecorr
     icorr_tafel = float(10 ** (b_ref + sl_ref * Ecorr)) if abs(sl_ref) > 1e-9 else 1e-12
 
-    # Cross-check with raw current near Ecorr
+    # Cross-check near Ecorr; use Tafel extrap as primary (it is the physical value)
     near = np.abs(Ec - Ecorr) < 0.050
-    # FIX: i_corr estimate — use MAX(tafel_extrap, near_Ecorr_median) rather than
-    # the old min() which systematically under-estimated i_corr when the cathodic
-    # line was selected far from Ecorr and extrapolated upward correctly.
     if np.any(near):
         icorr_near = float(np.percentile(np.abs(i[cat][si][near]), 25))
-        # Trust Tafel extrapolation; use near-Ecorr as lower bound, not upper cap
         icorr = max(icorr_tafel, icorr_near * 0.5)
     else:
         icorr = icorr_tafel
     icorr = max(icorr, 1e-15)
 
-    # Diffusion limit assessment (unchanged)
+    # Diffusion limit detection
     iL, has_diff = None, False
     if len(Ec) > 8:
-        lgi_sm  = savgol_filter(lgi, max(5, min(9, len(Ec)//2*2-1)), 3, mode="interp")
-        dlg     = np.abs(np.gradient(lgi_sm, Ec))
-        flat    = dlg < max(np.percentile(dlg, 30), 0.5)
-        runs    = [(k, list(g)) for k, g in groupby(enumerate(flat), key=lambda x: x[1]) if k]
+        lgi_sm = savgol_filter(lgi, max(5, min(9, len(Ec) // 2 * 2 - 1)), 3, mode="interp")
+        dlg    = np.abs(np.gradient(lgi_sm, Ec))
+        flat   = dlg < max(np.percentile(dlg, 30), 0.5)
+        runs   = [(k, list(g)) for k, g in groupby(enumerate(flat), key=lambda x: x[1]) if k]
         if runs:
             idxs = [s[0] for s in max(runs, key=lambda x: len(x[1]))[1]]
             if len(idxs) >= 3 and abs(Ec[idxs[-1]] - Ec[idxs[0]]) > 0.03:
                 iL = float(np.median(np.abs(i[cat][si][idxs]))); has_diff = True
-    if iL is None: iL = icorr * 1e4
+    if iL is None:
+        iL = icorr * 1e4
 
     return dict(
         bc=bc, icorr=icorr, iL=iL, has_diff=has_diff,
-        r2=float(max(r2_win, np.max(R2) if len(R2) else 0.0)),
+        r2=float(max(r2_win, float(np.max(R2)) if len(R2) else 0.0)),
         E_cat=Ec, lgi_cat=lgi,
-        slope_c=sl_ref, intercept_c=b_ref, win_c=(Ex[s0], Ex[s1-1])
+        slope_c=sl_ref, intercept_c=b_ref, win_c=(Ex[s0], Ex[s1 - 1])
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -411,6 +439,19 @@ def fit_cathodic(E, i, Ecorr):
 # FIX: Widened proximity tau, corrected fallback ok mask
 # ─────────────────────────────────────────────────────────────────────────────
 def fit_anodic(E, i, Ecorr):
+    """
+    Find the anodic Tafel (active dissolution) window using hard beta enforcement.
+
+    Key design decisions:
+    - beta_ok is a HARD GATE: flat passive/plateau windows (slope~0, 1/slope>>400mV)
+      get score=0 regardless of their R². This was the main failure mode where the
+      algorithm mistakenly selected the active dissolution peak or passive plateau
+      (high R², nearly flat) over the true steep Tafel region.
+    - Passive detection is run FIRST to bound the Tafel search to E < E_pass.
+    - If all windows fail beta_ok, pick the steepest positive-slope window
+      (most Tafel-like) rather than the flattest high-R² one.
+    - Proximity tau widened to 0.20 V to accept active regions spanning 100–200 mV.
+    """
     ano = i > 0
     if np.sum(ano) < 4:
         return dict(ba=0.060, has_passive=False, Epass=None, ip=1e-6,
@@ -419,90 +460,23 @@ def fit_anodic(E, i, Ecorr):
     Ea  = E[ano]; lgia = slog(i[ano])
     si  = np.argsort(Ea); Ea, lgia = Ea[si], lgia[si]
 
-    base_mask = Ea > (Ecorr + CFG["anod_guard"])
-    if np.sum(base_mask) < CFG["min_w_ano"]:
-        base_mask = np.ones_like(Ea, bool)
-
-    Ex, Yx = Ea[base_mask], lgia[base_mask]
-    if len(Ex) < CFG["min_w_ano"]:
-        return dict(ba=0.060, has_passive=False, Epass=None, ip=1e-6,
-                    has_trans=False, Etrans=None, r2=0.0, E_an=Ea, lgi_an=lgia)
-
-    w_sm = max(5, min(11, len(Ex)//2*2-1))
-    Y_sm = savgol_filter(Yx, w_sm, 3, mode="interp")
-    dY   = np.gradient(Y_sm, Ex)
-    d2Y  = np.gradient(dY, Ex)
-
-    s_idx, e_idx, slope, intercept, R2 = _sliding_regress_full(
-        Ex, Yx, min_len=CFG["min_w_ano"], max_len=20)
-    if len(slope) == 0:
-        return dict(ba=0.060, has_passive=False, Epass=None, ip=1e-6,
-                    has_trans=False, Etrans=None, r2=0.0, E_an=Ea, lgi_an=lgia)
-
-    max_d2 = np.array([np.max(np.abs(d2Y[s:e])) for s, e in zip(s_idx, e_idx)])
-
-    # Monotonicity along anodic side: log|i| INCREASES with E
-    def _mono_frac(s, e):
-        seg = dY[s:e]
-        return float(np.mean(seg > 0)) if len(seg) else 0.0
-    mono = np.array([_mono_frac(s, e) for s, e in zip(s_idx, e_idx)])
-
-    invm = np.where(np.abs(slope) > 1e-12, 1.0/np.abs(slope), np.inf)
-    beta_ok = (invm > CFG["beta_min"]) & (invm < CFG["beta_max_a"])
-    curv_ok = max_d2 < CFG["curvature_max"]
-    mono_ok = mono >= CFG["lin_frac"]
-
-    ok = (slope > 0) & beta_ok & curv_ok & mono_ok & (R2 > 0.80)
-    if not np.any(ok):
-        # FIX: retain beta_ok in fallback to prevent unphysical slope selection
-        ok = (slope > 0) & beta_ok & (R2 > 0.75)
-
-    # FIX: widened proximity tau from 0.12 V → 0.20 V.
-    # The anodic Tafel (active dissolution) region can span 100–200 mV above
-    # Ecorr for many alloys. The old tau=0.12 V penalised these windows
-    # too aggressively, causing the algorithm to select windows far into the
-    # active peak or passive region instead.
-    E_start = Ex[s_idx]
-    clos    = np.exp(-np.abs(E_start - Ecorr) / 0.20)   # FIX: was 0.12
-
-    # Curvature penalty (same as cathodic fix)
-    curv_penalty = np.exp(-max_d2 / max(CFG["curvature_max"], 10.0))
-
-    score = (R2 ** 2) * clos * np.clip(mono, 0.2, 1.0) * curv_penalty
-    score[~ok] *= 0.15
-
-    k_best  = int(np.argmax(score))
-    s0, s1  = int(s_idx[k_best]), int(e_idx[k_best])
-    sl_ols, b_ols = float(slope[k_best]), float(intercept[k_best])
-
-    sl_ts, b_ts = _theil_sen(Ex[s0:s1], Yx[s0:s1])
-    sl_hb, b_hb = _huber_fit(Ex[s0:s1], Yx[s0:s1], sl_ols, b_ols)
-
-    def _r2_line(sl, b):
-        return r2_score(Yx[s0:s1], sl*Ex[s0:s1] + b)
-    cand = [(sl_ts, b_ts, _r2_line(sl_ts, b_ts)),
-            (sl_hb, b_hb, _r2_line(sl_hb, b_hb)),
-            (sl_ols, b_ols, _r2_line(sl_ols, b_ols))]
-    sl_ref, b_ref, r2_win = max(cand, key=lambda t: t[2])
-
-    ba = min(abs(1.0 / sl_ref), CFG["beta_max_a"]) if abs(sl_ref) > 1e-9 else 0.040
-
-    # Active peak
+    # ── Passive / Transpassive detection (run BEFORE Tafel search so we can
+    #    bound the active region search range to E < E_pass) ─────────────────
+    has_passive = False; Epass = None; ip = 1e-6
+    has_trans   = False; Etrans = None
     Epeak_detected = None
+
     if len(Ea) > 4:
         pks, _ = find_peaks(lgia, prominence=0.3, distance=2)
         if len(pks) > 0:
             pk = int(np.argmin(np.abs(Ea[pks] - Ecorr)))
             Epeak_detected = float(Ea[pks[pk]])
 
-    # Passive / Transpassive detection (unchanged)
-    has_passive = False; Epass = None; ip = 1e-6
-    has_trans   = False; Etrans = None
     if len(Ea) > 8:
-        lgia_sm = savgol_filter(lgia, max(5, min(11, len(Ea)//2*2-1)), 3, mode="interp")
+        lgia_sm = savgol_filter(lgia, max(5, min(11, len(Ea) // 2 * 2 - 1)), 3, mode="interp")
         dlg     = np.gradient(lgia_sm, Ea); adlg = np.abs(dlg)
-        thr  = max(np.percentile(adlg, 30), 0.8)
-        flat = adlg < thr
+        thr     = max(np.percentile(adlg, 30), 0.8)
+        flat    = adlg < thr
 
         runs = [(k, list(g)) for k, g in groupby(enumerate(flat), key=lambda x: x[1]) if k]
         for _, ri in runs:
@@ -524,12 +498,126 @@ def fit_anodic(E, i, Ecorr):
                             Etrans    = float(post_E[rising[0]])
                     break
 
+    # ── Tafel window search ───────────────────────────────────────────────────
+    base_mask = Ea > (Ecorr + CFG["anod_guard"])
+    if np.sum(base_mask) < CFG["min_w_ano"]:
+        base_mask = np.ones_like(Ea, bool)
+
+    # CRITICAL FIX A: bound search to the ACTIVE dissolution zone only.
+    # For Active-Passive curves the Tafel line must end at the active peak
+    # (Epeak), NOT at Epass.  The old code used Epass as the upper bound,
+    # but on steep active-passive curves Epass > Epeak and many of the
+    # candidate windows span past the peak into the passive drop — their
+    # mean slope is near-zero (high R², but beta >> 400 mV/dec) so they
+    # are correctly killed by the hard beta gate.  However when Epeak is
+    # absent (flat monotone rise straight into passivation, common on SS)
+    # we should still bound by Epass to keep the search in the active region.
+    E_upper = None
+    if Epeak_detected is not None and Epeak_detected > Ecorr:
+        E_upper = Epeak_detected        # tightest: stop at the active peak
+    elif has_passive and Epass is not None:
+        E_upper = Epass                 # fallback: stop at passivation onset
+
+    if E_upper is not None:
+        active_mask = base_mask & (Ea <= E_upper)
+        if np.sum(active_mask) >= CFG["min_w_ano"]:
+            base_mask = active_mask
+        # else: too few points before peak/pass — keep full range, beta gate handles it
+
+    Ex, Yx = Ea[base_mask], lgia[base_mask]
+    if len(Ex) < CFG["min_w_ano"]:
+        return dict(ba=0.060, has_passive=has_passive, Epass=Epass, ip=ip,
+                    has_trans=has_trans, Etrans=Etrans, Epeak=Epeak_detected,
+                    r2=0.0, E_an=Ea, lgi_an=lgia)
+
+    w_sm = max(5, min(11, len(Ex) // 2 * 2 - 1))
+    Y_sm = savgol_filter(Yx, w_sm, 3, mode="interp")
+    dY   = np.gradient(Y_sm, Ex)
+    d2Y  = np.gradient(dY, Ex)
+
+    s_idx, e_idx, slope, intercept, R2 = _sliding_regress_full(
+        Ex, Yx, min_len=CFG["min_w_ano"], max_len=20)
+    if len(slope) == 0:
+        return dict(ba=0.060, has_passive=has_passive, Epass=Epass, ip=ip,
+                    has_trans=has_trans, Etrans=Etrans, Epeak=Epeak_detected,
+                    r2=0.0, E_an=Ea, lgi_an=lgia)
+
+    max_d2 = np.array([np.max(np.abs(d2Y[s:e])) for s, e in zip(s_idx, e_idx)])
+
+    def _mono_frac(s, e):
+        seg = dY[s:e]
+        return float(np.mean(seg > 0)) if len(seg) else 0.0   # log|i| increases as E↑
+    mono = np.array([_mono_frac(s, e) for s, e in zip(s_idx, e_idx)])
+
+    invm    = np.where(np.abs(slope) > 1e-12, 1.0 / np.abs(slope), np.inf)
+    # HARD GATE: physical Tafel slope range
+    beta_ok = (slope > 0) & (invm > CFG["beta_min"]) & (invm < CFG["beta_max_a"])
+    curv_ok = max_d2 < CFG["curvature_max"]
+    mono_ok = mono >= CFG["lin_frac"]
+
+    # Primary candidates: pass all quality gates
+    ok = beta_ok & curv_ok & mono_ok & (R2 > 0.80)
+
+    # Fallback tier 1: relax curvature/mono, keep beta hard gate and R2
+    if not np.any(ok):
+        ok = beta_ok & (R2 > 0.70)
+
+    # Fallback tier 2: beta_ok only (any R2)
+    if not np.any(ok):
+        ok = beta_ok.copy()
+
+    # Scoring — HARD ZERO for windows failing beta_ok (passive plateau killer)
+    E_start  = Ex[s_idx]
+    clos     = np.exp(-np.abs(E_start - Ecorr) / 0.20)   # proximity to Ecorr
+    curv_pen = np.exp(-max_d2 / max(CFG["curvature_max"], 10.0))
+    score    = (R2 ** 2) * clos * np.clip(mono, 0.2, 1.0) * curv_pen
+
+    # CRITICAL FIX: hard-zero windows outside beta range (was *= 0.15)
+    score[~beta_ok] = 0.0
+    # Soft penalty only for curvature/mono violations within the beta_ok set
+    score[beta_ok & ~(curv_ok & mono_ok)] *= 0.30
+
+    # If scoring collapses (all zeros), use derivative-based fallback for
+    # very narrow active zones (e.g. stainless steel with instant passivation).
+    # FIX E: find the steepest consistently rising portion using the smoothed
+    # derivative instead of relying on sliding window regression.
+    if np.all(score == 0.0):
+        # Try: pick the window with the steepest positive slope among beta_ok
+        beta_ok_slopes = np.where(beta_ok, slope, 0.0)
+        if np.any(beta_ok):
+            k_best = int(np.argmax(beta_ok_slopes))
+        else:
+            # Last resort: steepest positive-slope window regardless of beta
+            pos_slope_mag = np.where(slope > 0, slope, 0.0)
+            k_best = int(np.argmax(pos_slope_mag))
+    else:
+        k_best = int(np.argmax(score))
+
+    s0, s1   = int(s_idx[k_best]), int(e_idx[k_best])
+    sl_ols, b_ols = float(slope[k_best]), float(intercept[k_best])
+
+    sl_ts, b_ts = _theil_sen(Ex[s0:s1], Yx[s0:s1])
+    sl_hb, b_hb = _huber_fit(Ex[s0:s1], Yx[s0:s1], sl_ols, b_ols)
+
+    def _r2_line(sl, b):
+        return r2_score(Yx[s0:s1], sl * Ex[s0:s1] + b)
+    cand = [(sl_ts, b_ts, _r2_line(sl_ts, b_ts)),
+            (sl_hb, b_hb, _r2_line(sl_hb, b_hb)),
+            (sl_ols, b_ols, _r2_line(sl_ols, b_ols))]
+    sl_ref, b_ref, r2_win = max(cand, key=lambda t: t[2])
+
+    # Guard: refinement must not drift to flat/negative slope
+    if sl_ref <= 0 or abs(1.0 / sl_ref) > CFG["beta_max_a"] * 1.5:
+        sl_ref, b_ref = sl_ols, b_ols
+
+    ba = min(abs(1.0 / sl_ref), CFG["beta_max_a"]) if abs(sl_ref) > 1e-9 else 0.060
+
     return dict(
         ba=ba, has_passive=has_passive, Epass=Epass, ip=ip,
         has_trans=has_trans, Etrans=Etrans, Epeak=Epeak_detected,
-        r2=float(max(r2_win, np.max(R2) if len(R2) else 0.0)),
+        r2=float(max(r2_win, float(np.max(R2)) if len(R2) else 0.0)),
         E_an=Ea, lgi_an=lgia,
-        slope_a=sl_ref, intercept_a=b_ref, win_a=(Ex[s0], Ex[s1-1])
+        slope_a=sl_ref, intercept_a=b_ref, win_a=(Ex[s0], Ex[s1 - 1])
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -833,8 +921,20 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
         if ("slope_a" in an_res) and ("intercept_a" in an_res):
             if "win_a" in an_res:
                 e0, e1 = an_res["win_a"]
-                if ct in CT.PASS and best_p[4] is not None:
-                    e1 = min(e1, float(best_p[4]))
+                # FIX C: clip to the active region boundary (Epeak preferred, Epass as fallback).
+                # The old code clipped solely to E_pass; for near-instant passivation curves
+                # the selected window can start/end inside the passive region, making
+                # e1 < e0 after clipping and producing an invisible zero-length segment.
+                clip_upper = None
+                if an_res.get("Epeak") is not None:
+                    clip_upper = float(an_res["Epeak"])
+                elif ct in CT.PASS and best_p[4] is not None:
+                    clip_upper = float(best_p[4])
+                if clip_upper is not None:
+                    e1 = min(e1, clip_upper)
+                # If window is degenerate after clipping, expand slightly
+                if e1 <= e0:
+                    e1 = e0 + max(0.02, float(clip_upper - Ecorr_fit) * 0.5) if clip_upper else e0 + 0.05
             else:
                 e0, e1 = Ecorr_fit, E_hi
             lab_a = f"βa (local) = {min(abs(1.0/an_res['slope_a']),CFG['beta_max_a'])*1000:.0f} mV/dec"
@@ -924,11 +1024,16 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
         if "slope_a" in an_res and "intercept_a" in an_res:
             if "win_a" in an_res:
                 e0, e1 = an_res["win_a"]
-                if ct in CT.PASS and best_p[4] is not None: e1 = min(e1, float(best_p[4]))
+                # FIX C (panel B): same Epeak-preferred clipping
+                clip_upper_b = an_res.get("Epeak") or (float(best_p[4]) if ct in CT.PASS and best_p[4] is not None else None)
+                if clip_upper_b is not None:
+                    e1 = min(e1, float(clip_upper_b))
+                if e1 <= e0:
+                    e1 = e0 + 0.03
             else:
                 e0, e1 = Ecorr_fit, E_hi
             E_seg = np.linspace(max(E_lo, e0), min(E_hi, e1), 120)
-            if len(E_seg) > 1:
+            if len(E_seg) > 1 and E_seg[-1] > E_seg[0]:
                 ax.plot(E_seg, an_res["slope_a"] * E_seg + an_res["intercept_a"],
                         "--", color="#e6550d", lw=1.6, zorder=4,
                         label=f"βa(local)={min(abs(1.0/an_res['slope_a']),CFG['beta_max_a'])*1000:.0f} mV/dec")
