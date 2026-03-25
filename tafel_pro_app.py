@@ -1,6 +1,6 @@
 """
 Polarization Curve Fitter — Publication-Grade Streamlit App
-Robust local Tafel overlays + Tafel intersection i_corr
+(Robust local Tafel overlays + Tafel intersection i_corr + Original UI)
 """
 
 import streamlit as st
@@ -28,58 +28,35 @@ from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
 warnings.filterwarnings("ignore")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PAGE CONFIG
+# PAGE CONFIG & SESSION STATE
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Polarization Curve Fitter", page_icon="⚡",
                    layout="wide", initial_sidebar_state="expanded")
 
+if "results" not in st.session_state: st.session_state.results = []
+if "figures" not in st.session_state: st.session_state.figures = []
+
+st.markdown("""
+<style>
+  .main-header{font-size:2rem;font-weight:700;color:#1a3a5c;
+    border-bottom:3px solid #2e86de;padding-bottom:8px;margin-bottom:1rem}
+  div[data-testid="metric-container"]{
+    background:#f0f4ff;border-left:3px solid #2e86de;
+    border-radius:6px;padding:8px 12px}
+</style>""", unsafe_allow_html=True)
+
 # ─────────────────────────────────────────────────────────────────────────────
-# CONSTANTS & CONFIG
+# CONSTANTS & MATH
 # ─────────────────────────────────────────────────────────────────────────────
-TINY    = 1e-30
+TINY = 1e-30
 PALETTE = ["#2e86de","#e84393","#27ae60","#e67e22","#8e44ad","#16a085","#c0392b"]
+REGION_COLORS = {"cathodic": ("#6baed6", 0.14), "active": ("#fd8d3c", 0.22), "passive": ("#74c476", 0.16), "transpassive": ("#9e9ac8", 0.18)}
+MATERIALS = {"Carbon Steel / Iron": (27.92, 7.87), "304 Stainless Steel": (25.10, 7.90), "316 Stainless Steel": (25.56, 8.00), "Copper": (31.77, 8.96), "Aluminum": (8.99, 2.70)}
 
-REGION_COLORS = {
-    "cathodic":     ("#6baed6", 0.14),
-    "active":       ("#fd8d3c", 0.22),
-    "passive":      ("#74c476", 0.16),
-    "transpassive": ("#9e9ac8", 0.18),
-}
-
-MATERIALS = {
-    "Carbon Steel / Iron":   (27.92, 7.87),
-    "304 Stainless Steel":   (25.10, 7.90),
-    "316 Stainless Steel":   (25.56, 8.00),
-    "Copper":                (31.77, 8.96),
-    "Aluminum":              ( 8.99, 2.70),
-}
-
-CFG = dict(
-    cath_guard=0.030,      # V — Distance from Ecorr to avoid rounding
-    anod_guard=0.015,      
-    curvature_max=35.0,    
-    lin_frac=0.75,         
-    min_w_cat=8,           # More points for stability
-    min_w_ano=6,           
-    beta_min=0.020,        
-    beta_max_c=0.450,      
-    beta_max_a=0.400       
-)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MATH HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
 def slog(x): return np.log10(np.maximum(np.abs(x), TINY))
-
 def sig(x, k=40.0):
     xk = np.clip(k * x, -60, 60)
-    return np.where(xk >= 0, 1.0 / (1.0 + np.exp(-xk)),
-                    np.exp(xk) / (1.0 + np.exp(xk)))
-
-def r2_score(yt, yp):
-    sr = np.sum((yt - yp) ** 2)
-    st = np.sum((yt - np.mean(yt)) ** 2)
-    return float(max(0.0, 1.0 - sr / st)) if st > 1e-30 else 0.0
+    return np.where(xk >= 0, 1.0 / (1.0 + np.exp(-xk)), np.exp(xk) / (1.0 + np.exp(xk)))
 
 def _theil_sen(x, y):
     m = len(x)
@@ -89,17 +66,20 @@ def _theil_sen(x, y):
     valid = np.abs(dx) > 1e-15
     slopes = (y[j_idx][valid] - y[i_idx][valid]) / dx[valid]
     slope = float(np.median(slopes)) if len(slopes) else 0.0
-    intercept = float(np.median(y - slope * x))
-    return slope, intercept
+    return slope, float(np.median(y - slope * x))
+
+def r2_score(yt, yp):
+    sr = np.sum((yt - yp) ** 2)
+    st = np.sum((yt - np.mean(yt)) ** 2)
+    return float(max(0.0, 1.0 - sr / st)) if st > 1e-30 else 0.0
 
 # ─────────────────────────────────────────────────────────────────────────────
-# VECTORIZED SLIDING REGRESSION
+# ROBUST SLIDING REGRESSION & BRANCH FITTING
 # ─────────────────────────────────────────────────────────────────────────────
-def _sliding_regress_full(x, y, min_len=4, max_len=25):
+def _sliding_regress_full(x, y, min_len, max_len=25):
     n = len(x)
     if n < min_len: return (np.array([], int), np.array([], int), np.array([]), np.array([]), np.array([]))
-    Sx = np.cumsum(x); Sy = np.cumsum(y)
-    Sxx = np.cumsum(x*x); Sxy = np.cumsum(x*y); Syy = np.cumsum(y*y)
+    Sx, Sy, Sxx, Sxy, Syy = np.cumsum(x), np.cumsum(y), np.cumsum(x*x), np.cumsum(x*y), np.cumsum(y*y)
     starts, ends, slopes, inters, r2s = [], [], [], [], []
     for w in range(min_len, min(max_len, n)+1):
         i0 = np.arange(0, n - w + 1); i1 = i0 + w - 1
@@ -112,144 +92,133 @@ def _sliding_regress_full(x, y, min_len=4, max_len=25):
         sse = (syy - 2*itp*sy - 2*slp*sxy + (itp**2)*w + 2*itp*slp*sx + (slp**2)*sxx)
         sst = syy - w * my * my
         r2 = np.clip(np.where(sst > 1e-18, 1.0 - sse/sst, 0.0), 0.0, 1.0)
-        starts.append(i0); ends.append(i1 + 1); slopes.append(slp); inters.append(itp); r2s.append(r2)
+        starts.append(i0); ends.append(i1+1); slopes.append(slp); inters.append(itp); r2s.append(r2)
     return np.concatenate(starts), np.concatenate(ends), np.concatenate(slopes), np.concatenate(inters), np.concatenate(r2s)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BRANCH FITTING (FIXED LOGIC)
-# ─────────────────────────────────────────────────────────────────────────────
-def fit_cathodic(E, i, Ecorr):
+def fit_cathodic(E, i, Ecorr, cfg):
     cat = i < 0
-    if np.sum(cat) < CFG["min_w_cat"]: return dict(bc=0.12, icorr=1e-9, r2=0)
+    if np.sum(cat) < cfg["min_w_cat"]: return dict(bc=0.12, icorr=1e-9, r2=0)
     Ec, lgi = E[cat], slog(i[cat])
     si = np.argsort(Ec); Ec, lgi = Ec[si], lgi[si]
-    mask = Ec < (Ecorr - CFG["cath_guard"])
+    mask = Ec < (Ecorr - cfg["cath_guard"])
     Ex, Yx = Ec[mask], lgi[mask]
-    if len(Ex) < CFG["min_w_cat"]: Ex, Yx = Ec, lgi
-    
-    s_idx, e_idx, slps, itps, r2s = _sliding_regress_full(Ex, Yx, CFG["min_w_cat"], 25)
-    if len(slps) == 0: return dict(bc=0.12, icorr=1e-9, r2=0)
-
-    # Scoring: High R2 + Negative slope + Proximity to Ecorr
-    invm = 1.0 / (np.abs(slps) + 1e-20)
-    beta_ok = (invm > CFG["beta_min"]) & (invm < CFG["beta_max_c"])
-    dist_score = np.exp(-np.abs(Ex[e_idx-1] - Ecorr) / 0.15)
-    score = r2s * dist_score
-    score[(slps >= 0) | (~beta_ok)] = 0
-    
+    if len(Ex) < cfg["min_w_cat"]: Ex, Yx = Ec, lgi
+    s_idx, e_idx, slps, itps, r2s = _sliding_regress_full(Ex, Yx, cfg["min_w_cat"])
+    score = r2s * np.exp(-np.abs(Ex[e_idx-1] - Ecorr) / 0.15)
+    score[slps >= 0] = 0
     best = np.argmax(score)
     sl_ref, b_ref = _theil_sen(Ex[s_idx[best]:e_idx[best]], Yx[s_idx[best]:e_idx[best]])
-    
-    return dict(bc=abs(1.0/sl_ref), icorr=10**(b_ref + sl_ref*Ecorr), 
-                slope_c=sl_ref, intercept_c=b_ref, win_c=(Ex[s_idx[best]], Ex[e_idx[best]-1]),
-                r2=r2s[best], E_cat=Ec, lgi_cat=lgi, has_diff=False, iL=1e-2)
+    return dict(bc=abs(1.0/sl_ref), icorr=10**(b_ref + sl_ref*Ecorr), slope_c=sl_ref, intercept_c=b_ref, win_c=(Ex[s_idx[best]], Ex[e_idx[best]-1]), r2=r2s[best], E_cat=Ec, lgi_cat=lgi)
 
-def fit_anodic(E, i, Ecorr):
+def fit_anodic(E, i, Ecorr, cfg):
     ano = i > 0
-    if np.sum(ano) < CFG["min_w_ano"]: return dict(ba=0.06, r2=0)
+    if np.sum(ano) < cfg["min_w_ano"]: return dict(ba=0.06, r2=0)
     Ea, lgia = E[ano], slog(i[ano])
     si = np.argsort(Ea); Ea, lgia = Ea[si], lgia[si]
-    mask = Ea > (Ecorr + CFG["anod_guard"])
+    mask = Ea > (Ecorr + cfg["anod_guard"])
     Ex, Yx = Ea[mask], lgia[mask]
-    if len(Ex) < CFG["min_w_ano"]: Ex, Yx = Ea, lgia
-    
-    s_idx, e_idx, slps, itps, r2s = _sliding_regress_full(Ex, Yx, CFG["min_w_ano"], 25)
-    if len(slps) == 0: return dict(ba=0.06, r2=0)
-
-    invm = 1.0 / (np.abs(slps) + 1e-20)
-    beta_ok = (invm > CFG["beta_min"]) & (invm < CFG["beta_max_a"])
-    dist_score = np.exp(-np.abs(Ex[s_idx] - Ecorr) / 0.15)
-    score = r2s * dist_score
-    score[(slps <= 0) | (~beta_ok)] = 0
-    
+    if len(Ex) < cfg["min_w_ano"]: Ex, Yx = Ea, lgia
+    s_idx, e_idx, slps, itps, r2s = _sliding_regress_full(Ex, Yx, cfg["min_w_ano"])
+    score = r2s * np.exp(-np.abs(Ex[s_idx] - Ecorr) / 0.15)
+    score[slps <= 0] = 0
     best = np.argmax(score)
     sl_ref, b_ref = _theil_sen(Ex[s_idx[best]:e_idx[best]], Yx[s_idx[best]:e_idx[best]])
-    
-    # Passive detection (simple threshold on gradient)
-    has_p = False; Ep = None; ip = 1e-6
-    if len(Ea) > 10:
-        grad = np.abs(np.gradient(savgol_filter(lgia, 7, 3), Ea))
-        flats = np.where(grad < 1.0)[0]
-        if len(flats) > 4:
-            has_p = True; Ep = Ea[flats[0]]; ip = 10**lgia[flats[len(flats)//2]]
-
-    return dict(ba=abs(1.0/sl_ref), slope_a=sl_ref, intercept_a=b_ref, 
-                win_a=(Ex[s_idx[best]], Ex[e_idx[best]-1]), r2=r2s[best],
-                E_an=Ea, lgi_an=lgia, has_passive=has_p, Epass=Ep, ip=ip, has_trans=False)
+    return dict(ba=abs(1.0/sl_ref), slope_a=sl_ref, intercept_a=b_ref, win_a=(Ex[s_idx[best]], Ex[e_idx[best]-1]), r2=r2s[best], E_an=Ea, lgi_an=lgia, has_passive=False)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PHYSICS MODEL & GLOBAL FIT
+# SIDEBAR (RESTORED ORIGINAL)
 # ─────────────────────────────────────────────────────────────────────────────
-def pol_model(E, p, ct="A"):
-    Ec, ic, ba, bc = p[0], p[1], max(p[2],1e-4), max(p[3],1e-4)
-    eta = E - Ec
-    i_cat = ic * np.exp(-2.303 * eta / bc)
-    i_act = ic * np.exp(2.303 * eta / ba)
-    if ct == "A": return i_act - i_cat
-    # Simple Passive model
-    Ep, ip = p[4], p[6]
-    w_p = sig(E - Ep, 1.0/max(p[5],0.001))
-    return ((1.0 - w_p)*i_act + w_p*ip) - i_cat
-
-def global_polish(E, i_obs, p0, ct):
-    ld = slog(i_obs)
-    def obj(x):
-        # x: [Ecorr, logIcorr, ba, bc, ...]
-        p = x.copy(); p[1] = 10**x[1]
-        if ct == "P": p[6] = 10**x[6]
-        pred = slog(pol_model(E, p, ct))
-        return np.sum((ld - pred)**2)
-    
-    x0 = p0.copy(); x0[1] = np.log10(max(p0[1], TINY))
-    if ct == "P": x0[6] = np.log10(max(p0[6], TINY))
-    
-    res = minimize(obj, x0, method='Nelder-Mead', options={'maxiter': 2000})
-    pf = res.x.copy(); pf[1] = 10**pf[1]
-    if ct == "P": pf[6] = 10**pf[6]
-    return pf, r2_score(ld, slog(pol_model(E, pf, ct)))
+with st.sidebar:
+    st.markdown("## ⚙️ Configuration")
+    material = st.selectbox("Material (for CR calculation)", list(MATERIALS.keys()), index=0)
+    ew_mat, rho_mat = MATERIALS[material]
+    st.divider()
+    st.markdown("**Data Import**")
+    area = st.number_input("Electrode area (cm²)", 0.001, 1000.0, 1.0)
+    unit_fac = st.selectbox("Current unit", ["A/cm²","mA/cm²","µA/cm²"], index=0)
+    fac = {"A/cm²":1.0, "mA/cm²":1e-3, "µA/cm²":1e-6}[unit_fac]
+    st.divider()
+    st.markdown("**Plotting**")
+    show_regs = st.toggle("Shade regions", True)
+    pub_dpi = st.slider("Export DPI", 150, 600, 300)
+    with st.expander("Advanced (Detection Guards)"):
+        adv_cfg = {
+            "anod_guard": st.number_input("Anodic Guard (V)", 0.0, 0.1, 0.015, 0.005),
+            "cath_guard": st.number_input("Cathodic Guard (V)", 0.0, 0.15, 0.035, 0.005),
+            "min_w_ano": st.number_input("Min Anodic Pts", 3, 20, 6),
+            "min_w_cat": st.number_input("Min Cathodic Pts", 3, 20, 8)
+        }
+    if st.button("🗑 Clear all", use_container_width=True):
+        st.session_state.results, st.session_state.figures = [], []
+        st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STREAMLIT UI
+# MAIN UI & TABS (RESTORED ORIGINAL)
 # ─────────────────────────────────────────────────────────────────────────────
-st.title("⚡ Pro Polarization Fitter")
+st.markdown('<div class="main-header">⚡ Polarization Curve Fitter</div>', unsafe_allow_html=True)
+tab_fit, tab_res, tab_cmp = st.tabs(["📂 Upload & Fit", "📊 Results", "📋 Compare"])
 
-uploaded = st.file_uploader("Upload CSV", type="csv")
-if uploaded:
-    df = pd.read_csv(uploaded)
-    cols = df.columns.tolist()
-    e_col = st.selectbox("E Column", cols, index=0)
-    i_col = st.selectbox("i Column", cols, index=1)
-    
-    E = df[e_col].values; i = df[i_col].values
-    
-    if st.button("Run Fit"):
-        # 1. Ecorr
-        sc = np.where(np.diff(np.sign(i)))[0]
-        Ecorr = E[sc[0]] if len(sc)>0 else E[np.argmin(np.abs(i))]
-        
-        # 2. Branch Fits
-        cat_res = fit_cathodic(E, i, Ecorr)
-        an_res = fit_anodic(E, i, Ecorr)
-        
-        # 3. Global
-        ct = "P" if an_res['has_passive'] else "A"
-        p0 = [Ecorr, cat_res['icorr'], an_res['ba'], cat_res['bc'], 
-              an_res.get('Epass', Ecorr+0.2), 0.01, an_res.get('ip', 1e-6)]
-        
-        best_p, r2_val = global_polish(E, i, p0, ct)
-        
-        # 4. Plot
-        fig, ax = plt.subplots(figsize=(8, 5))
-        ax.scatter(E, slog(i), s=10, alpha=0.3, label="Data")
-        E_den = np.linspace(E.min(), E.max(), 500)
-        ax.plot(E_den, slog(pol_model(E_den, best_p, ct)), 'r', lw=2, label=f"Fit (R2={r2_val:.4f})")
-        
-        # Local Overlays
-        ax.plot(cat_res['win_c'], cat_res['slope_c']*np.array(cat_res['win_c'])+cat_res['intercept_c'], 'b--', lw=2, label="Local Cathodic")
-        ax.plot(an_res['win_a'], an_res['slope_a']*np.array(an_res['win_a'])+an_res['intercept_a'], 'orange', ls='--', lw=2, label="Local Anodic")
-        
-        ax.set_xlabel("E (V)"); ax.set_ylabel("log|i|")
-        ax.legend(); ax.grid(True, alpha=0.2)
-        st.pyplot(fig)
-        
-        st.write(f"**Results:** icorr={best_p[1]:.2e} A/cm², ba={best_p[2]*1000:.1f} mV, bc={best_p[3]*1000:.1f} mV")
+with tab_fit:
+    c1, c2 = st.columns([1.2, 0.8])
+    uploaded_files = c1.file_uploader("CSV Data", accept_multiple_files=True)
+    sample_name = c2.text_input("Sample label", "Sample 1")
+
+    if uploaded_files:
+        for idx, uf in enumerate(uploaded_files):
+            df_raw = pd.read_csv(uf)
+            num_cols = df_raw.select_dtypes(include=[np.number]).columns.tolist()
+            ec1, ec2 = st.columns(2)
+            e_col = ec1.selectbox(f"E column [{uf.name}]", num_cols, key=f"e_{idx}")
+            i_col = ec2.selectbox(f"i column [{uf.name}]", num_cols, key=f"i_{idx}")
+            
+            E = df_raw[e_col].values
+            i_obs = df_raw[i_col].values * fac / area
+
+            if st.button(f"🚀 Run Pipeline: {uf.name}", key=f"btn_{idx}", type="primary"):
+                # 1. Detect Ecorr
+                sc = np.where(np.diff(np.sign(i_obs)))[0]
+                Ecorr = E[sc[0]] if len(sc)>0 else E[np.argmin(np.abs(i_obs))]
+                
+                # 2. Branch Fits (using robust logic)
+                cat_res = fit_cathodic(E, i_obs, Ecorr, adv_cfg)
+                an_res = fit_anodic(E, i_obs, Ecorr, adv_cfg)
+                
+                # 3. Final Display Params
+                p = [Ecorr, cat_res['icorr'], an_res['ba'], cat_res['bc']]
+                
+                # 4. Figure (GridSpec)
+                fig = plt.figure(figsize=(12, 8), dpi=pub_dpi)
+                gs = GridSpec(2, 2, figure=fig)
+                ax1 = fig.add_subplot(gs[0, :])
+                ax1.scatter(E, slog(i_obs), s=10, alpha=0.4, label="Data")
+                # Visual Tafel Extensions
+                E_ext_c = np.linspace(cat_res['win_c'][0], Ecorr, 50)
+                ax1.plot(E_ext_c, cat_res['slope_c']*E_ext_c + cat_res['intercept_c'], 'r--', alpha=0.7)
+                E_ext_a = np.linspace(Ecorr, an_res['win_a'][1], 50)
+                ax1.plot(E_ext_a, an_res['slope_a']*E_ext_a + an_res['intercept_a'], 'g--', alpha=0.7)
+                ax1.set_title(f"Evans Diagram: {sample_name}")
+                st.pyplot(fig)
+                
+                # 5. Session Save
+                res_rec = {"name": sample_name, "params": p, "ba": p[2], "bc": p[3], "icorr": p[1], "Ecorr": p[0], "r2": cat_res['r2']}
+                st.session_state.results.append(res_rec)
+                
+                # 6. Metrics
+                m1, m2, m3 = st.columns(3)
+                m1.metric("E_corr (V)", f"{p[0]:.4f}")
+                m2.metric("i_corr (A/cm²)", f"{p[1]:.2e}")
+                m3.metric("CR (mm/yr)", f"{(p[1]*3.27*ew_mat/rho_mat):.4f}")
+
+with tab_res:
+    if st.session_state.results:
+        st.dataframe(pd.DataFrame(st.session_state.results))
+    else:
+        st.info("No results yet.")
+
+with tab_cmp:
+    if len(st.session_state.results) > 1:
+        fig_cmp, ax_cmp = plt.subplots()
+        for r in st.session_state.results:
+            ax_cmp.bar(r['name'], r['icorr'])
+        ax_cmp.set_yscale('log')
+        st.pyplot(fig_cmp)
