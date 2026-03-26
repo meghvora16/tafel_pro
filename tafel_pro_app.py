@@ -308,73 +308,93 @@ def fit_cathodic(E, i, Ecorr):
         return dict(bc=0.120, icorr=max(10**np.min(Yx), 1e-12), iL=1e-2,
                     has_diff=False, r2=0.0, E_cat=Ec, lgi_cat=lgi)
 
-    # Trim near-Ecorr points where log|i| is within 1 decade of the minimum
-    # (these are in the mixed-control transition zone and corrupt linear fits)
-    lgi_max_cat = np.max(Yx)   # highest log|i| is farthest from Ecorr
-    trim_mask = Yx < (lgi_max_cat - 0.3)  # keep only points more than 0.3 dec below peak
+    # Remove the diffusion plateau top (keeps Tafel + transition, drops flat plateau)
+    lgi_max_cat = np.max(Yx)
+    trim_mask = Yx < (lgi_max_cat - 0.3)
     if np.sum(trim_mask) >= CFG["min_w_cat"]:
         Ex, Yx = Ex[trim_mask], Yx[trim_mask]
 
-    # Smooth & derivatives for quality metrics
+    # Smooth & derivatives (use full trimmed range for smoothing)
     w_sm = max(5, min(11, len(Ex) // 2 * 2 - 1))
     Y_sm = savgol_filter(Yx, w_sm, 3, mode="interp")
     dY   = np.gradient(Y_sm, Ex)
     d2Y  = np.gradient(dY, Ex)
 
+    # ── Steep-region pre-filter ───────────────────────────────────────────────
+    # For diffusion-limited cathodic branches the data contains:
+    #   [transition zone: |dY/dE| is moderate] → [Tafel zone: |dY/dE| is maximum]
+    # The sliding window over the full range finds the smooth transition (low
+    # curvature, moderate slope) rather than the steep Tafel zone (high curvature
+    # because it borders the mixed-control zone near Ecorr).
+    # Fix: restrict the window search to points where the local slope magnitude
+    # exceeds 50% of its maximum value — this selects only the Tafel zone.
+    abs_dY    = np.abs(dY)
+    max_abs_dY = float(np.max(abs_dY)) if len(abs_dY) > 0 else 1.0
+    steep_pre  = abs_dY > 0.50 * max_abs_dY
+    if np.sum(steep_pre) >= CFG["min_w_cat"]:
+        Ex_sw, Yx_sw = Ex[steep_pre], Yx[steep_pre]
+        dY_sw  = dY[steep_pre]
+        d2Y_sw = d2Y[steep_pre]
+    else:
+        # Fallback: use full trimmed range if steep region is too small
+        Ex_sw, Yx_sw, dY_sw, d2Y_sw = Ex, Yx, dY, d2Y
+
     s_idx, e_idx, slope, intercept, R2 = _sliding_regress_full(
-        Ex, Yx, min_len=CFG["min_w_cat"], max_len=25)
+        Ex_sw, Yx_sw, min_len=CFG["min_w_cat"], max_len=25)
     if len(slope) == 0:
         return dict(bc=0.120, icorr=1e-9, iL=1e-2, has_diff=False, r2=0.0,
                     E_cat=Ec, lgi_cat=lgi)
 
-    # Per-window quality metrics
-    max_d2 = np.array([np.max(np.abs(d2Y[s:e])) for s, e in zip(s_idx, e_idx)])
+    # Per-window quality metrics on the (possibly pre-filtered) data
+    max_d2 = np.array([np.max(np.abs(d2Y_sw[s:e])) for s, e in zip(s_idx, e_idx)])
 
     def _mono_frac(s, e):
-        seg = dY[s:e]
-        return float(np.mean(seg < 0)) if len(seg) else 0.0   # log|i| decreases as E↑
+        seg = dY_sw[s:e]
+        return float(np.mean(seg < 0)) if len(seg) else 0.0
     mono = np.array([_mono_frac(s, e) for s, e in zip(s_idx, e_idx)])
 
     invm     = np.where(np.abs(slope) > 1e-12, 1.0 / np.abs(slope), np.inf)
     # HARD GATE: beta_ok is a strict physical constraint, not a scoring term
     beta_ok  = (slope < 0) & (invm > CFG["beta_min"]) & (invm < CFG["beta_max_c"])
-    curv_ok  = max_d2 < CFG["curvature_max"]
     mono_ok  = mono >= CFG["lin_frac"]
+    # Note: curvature is NOT used as a hard gate — for diffusion-limited cathodic
+    # branches the second derivative is large everywhere (sigmoid morphology), so
+    # curvature_max would eliminate ALL windows.  Instead, curvature feeds only
+    # into the scoring penalty below.
 
-    # Primary candidates: pass all quality gates
-    ok = beta_ok & curv_ok & mono_ok & (R2 > 0.85)
-
-    # Fallback tier 1: relax mono + curvature, keep beta_ok and R2
+    # Primary candidates: beta_ok + monotone + decent R²
+    ok = beta_ok & mono_ok & (R2 > 0.85)
     if not np.any(ok):
         ok = beta_ok & (R2 > 0.75)
-
-    # Fallback tier 2: beta only — pick steepest valid-direction window
-    # (never fall back to windows with wrong slope direction or unphysical beta)
     if not np.any(ok):
         ok = beta_ok.copy()
-
-    # Absolute last resort: steepest negative-slope window
     if not np.any(ok):
         ok = slope < 0
         if not np.any(ok):
             ok = np.ones(len(slope), bool)
 
-    # Scoring — NO proximity Gaussian for cathodic.
-    # The Gaussian at 150 mV from Ecorr fails for steep/diffusion-limited cathodic
-    # branches (stainless, passive alloys) where the true Tafel zone may be only
-    # 30–80 mV wide very close to Ecorr.  R² + curvature + monotonicity already
-    # capture linearity completely; the most linear window wins naturally.
-    # Window length bonus rewards more statistically robust fits.
-    curv_pen  = np.exp(-max_d2 / max(CFG["curvature_max"], 10.0))
-    win_len   = (e_idx - s_idx).astype(float)
-    len_bonus = np.log1p(win_len) / np.log1p(25.0)          # normalised [0,1]
-    score     = (R2 ** 2) * np.clip(mono, 0.2, 1.0) * curv_pen * (0.7 + 0.3 * len_bonus)
+    # ── Scoring ───────────────────────────────────────────────────────────────
+    # For diffusion-limited cathodic branches the morphology is:
+    #   [diffusion plateau] → [curved transition] → [steep Tafel] → [mixed control]
+    # The plateau and transition have SHALLOW slopes → eliminated by beta_ok.
+    # Within beta_ok windows, the TRUE Tafel region is the STEEPEST one.
+    # We therefore weight by (steep_bonus)² to sharply prefer the Tafel region.
+    # Curvature enters only as a soft penalty (exp term), never as a hard gate.
+    curv_pen   = np.exp(-max_d2 / max(CFG["curvature_max"], 10.0))
+    win_len    = (e_idx - s_idx).astype(float)
+    len_bonus  = np.log1p(win_len) / np.log1p(25.0)
 
-    # HARD ZERO for non-physical windows; soft penalty for quality failures
-    score[~beta_ok] = 0.0
-    score[beta_ok & ~(curv_ok & mono_ok)] *= 0.30
+    abs_slope       = np.abs(slope)
+    max_beta_slope  = float(np.max(abs_slope[beta_ok])) if np.any(beta_ok) else 1.0
+    steep_bonus     = abs_slope / max(max_beta_slope, 1e-9)   # [0,1]
 
-    # If everything is zero after hard gating, fall back to steepest beta_ok slope
+    # steep_bonus² dominates: steepest (= Tafel) window wins decisively
+    score = (R2 ** 2) * np.clip(mono, 0.2, 1.0) * curv_pen \
+            * (0.3 + 0.1 * len_bonus + 0.6 * steep_bonus ** 2)
+
+    score[~beta_ok] = 0.0                          # hard zero: wrong direction/beta
+    score[beta_ok & ~mono_ok] *= 0.40              # soft penalty: non-monotone windows
+
     if np.all(score == 0.0) or not np.any(ok):
         neg_slope_mag = np.where(slope < 0, np.abs(slope), 0.0)
         k_best = int(np.argmax(neg_slope_mag))
@@ -466,11 +486,30 @@ def fit_anodic(E, i, Ecorr):
     has_trans   = False; Etrans = None
     Epeak_detected = None
 
-    if len(Ea) > 4:
-        pks, _ = find_peaks(lgia, prominence=0.3, distance=2)
-        if len(pks) > 0:
-            pk = int(np.argmin(np.abs(Ea[pks] - Ecorr)))
-            Epeak_detected = float(Ea[pks[pk]])
+    if len(Ea) > 6:
+        # Smooth first for robust derivative and peak detection
+        w_pk = max(5, min(15, len(Ea) // 2 * 2 - 1))
+        lgia_pk = savgol_filter(lgia, w_pk, 3, mode="interp")
+        dY_pk   = np.gradient(lgia_pk, Ea)
+
+        # PRIMARY: derivative sign change (+→-) above Ecorr = active dissolution peak.
+        # This catches even very shallow peaks (< 0.1 decade) that find_peaks misses.
+        sign_chg = np.where(np.diff(np.sign(dY_pk)) < 0)[0]   # rising→falling
+        cands = [Ea[k] for k in sign_chg
+                 if Ea[k] > Ecorr + 0.005 and Ea[k] < Ea[-1] - 0.05]
+        if cands:
+            # Pick the first peak above Ecorr (closest to Ecorr = active peak)
+            Epeak_detected = float(min(cands))
+
+        # SECONDARY: find_peaks with reduced prominence (was 0.3, now 0.10)
+        # catches genuine peaks missed by the derivative method on noisy data
+        if Epeak_detected is None:
+            pks, _ = find_peaks(lgia_pk, prominence=0.10, distance=2)
+            pks_above = [p for p in pks if Ea[p] > Ecorr + 0.005]
+            if pks_above:
+                # closest to Ecorr among peaks
+                pk = min(pks_above, key=lambda p: abs(Ea[p] - Ecorr))
+                Epeak_detected = float(Ea[pk])
 
     if len(Ea) > 8:
         lgia_sm = savgol_filter(lgia, max(5, min(11, len(Ea) // 2 * 2 - 1)), 3, mode="interp")
