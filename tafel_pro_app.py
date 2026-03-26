@@ -97,10 +97,13 @@ CFG = dict(
     lin_frac=0.70,         # fraction of derivative signs consistent with slope
     min_w_cat=4,           # minimum window length (cathodic)
     min_w_ano=3,           # minimum window length (anodic)
-    # Tafel slope range (V/dec), ok if 1/|slope| is within these
-    beta_min=0.02,         # 20 mV/dec
-    beta_max_c=0.35,       # 350 mV/dec
-    beta_max_a=0.40        # 400 mV/dec
+    # Tafel slope range (V/dec). Physical upper limits based on BV theory:
+    # ba = RT/(alpha*F). alpha<0.09 -> ba>280mV/dec is unphysical.
+    # Old beta_max_a=0.400 let passive-region slopes (ba~300-400mV) pass
+    # the beta_ok gate, producing the ba=384mV/dec artefact seen in image.
+    beta_min=0.020,        # 20 mV/dec lower physical limit
+    beta_max_c=0.280,      # 280 mV/dec cathodic cap (was 350)
+    beta_max_a=0.250,      # 250 mV/dec anodic cap   (was 400 — this was the bug)
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -574,6 +577,32 @@ def fit_anodic(E, i, Ecorr):
     dY   = np.gradient(Y_sm, Ex)
     d2Y  = np.gradient(dY, Ex)
 
+    # ── Rising-only trim ──────────────────────────────────────────────────────
+    # After the E_upper bound the data should be monotonically rising (active
+    # dissolution), but noise in a long passive plateau can produce spurious
+    # sign-changes that dilute the active slope estimate.
+    # Trim any suffix where dY turns persistently negative (passive descent),
+    # keeping only the contiguous rising front from Ecorr upward.
+    # This was the root cause of ba=384 mV/dec in the image: the window
+    # extended into the passive drop where apparent slope ≈ 0, i.e. ba >> 250.
+    first_neg_run = None
+    for _k in range(len(dY) - 2):
+        if dY[_k] < 0 and dY[_k + 1] < 0:   # two consecutive negatives = descent
+            first_neg_run = _k
+            break
+    if first_neg_run is not None and first_neg_run >= CFG["min_w_ano"]:
+        Ex  = Ex[:first_neg_run]
+        Yx  = Yx[:first_neg_run]
+        dY  = dY[:first_neg_run]
+        d2Y = d2Y[:first_neg_run]
+        # Rerun sliding regression on trimmed data
+        if len(Ex) < CFG["min_w_ano"]:
+            Ex  = Ea[base_mask]; Yx  = lgia[base_mask]
+            w_sm2 = max(5, min(11, len(Ex)//2*2-1))
+            Y_sm2 = savgol_filter(Yx, w_sm2, 3, mode='interp')
+            dY  = np.gradient(Y_sm2, Ex)
+            d2Y = np.gradient(dY, Ex)
+
     s_idx, e_idx, slope, intercept, R2 = _sliding_regress_full(
         Ex, Yx, min_len=CFG["min_w_ano"], max_len=20)
     if len(slope) == 0:
@@ -581,7 +610,18 @@ def fit_anodic(E, i, Ecorr):
                     has_trans=has_trans, Etrans=Etrans, Epeak=Epeak_detected,
                     r2=0.0, E_an=Ea, lgi_an=lgia)
 
-    max_d2 = np.array([np.max(np.abs(d2Y[s:e])) for s, e in zip(s_idx, e_idx)])
+    # Clamp indices to trimmed array length
+    n_trim = len(dY)
+    s_idx_c = np.minimum(s_idx, n_trim - 1)
+    e_idx_c = np.minimum(e_idx, n_trim)
+    valid   = e_idx_c > s_idx_c
+    if not np.any(valid):
+        s_idx_c = s_idx; e_idx_c = e_idx; valid = np.ones(len(s_idx), bool)
+    max_d2 = np.array([np.max(np.abs(d2Y[s:max(s+1,e)])) for s, e in zip(s_idx_c[valid], e_idx_c[valid])])
+    # Pad back to full length for consistent indexing
+    max_d2_full = np.full(len(slope), max_d2.max() if len(max_d2) else 0.0)
+    max_d2_full[valid] = max_d2
+    max_d2 = max_d2_full
 
     def _mono_frac(s, e):
         seg = dY[s:e]
@@ -712,11 +752,14 @@ def _build_bounds(Ecorr, cat, an, ct, E_min, E_max, E_span):
     ba_fit  = float(an["ba"])
     bc_fit  = float(cat["bc"])
 
-    # Tafel slopes: tight relative band + absolute physical limits (from busbar)
+    # Tafel slopes: tight relative band + absolute physical limits.
+    # Upper caps lowered to match CFG beta_max values — prevents the global
+    # optimizer from finding unphysical solutions (ba>250mV or bc>280mV)
+    # even if the local Tafel estimate happened to be inflated.
     ba_lo = max(ba_fit * 0.50, 0.020)
-    ba_hi = min(ba_fit * 2.00, 0.500)
+    ba_hi = min(ba_fit * 2.00, CFG["beta_max_a"])   # hard ceiling 250 mV/dec
     bc_lo = max(bc_fit * 0.50, 0.020)
-    bc_hi = min(bc_fit * 2.00, 0.500)
+    bc_hi = min(bc_fit * 2.00, CFG["beta_max_c"])   # hard ceiling 280 mV/dec
 
     # iL: must be physically larger than icorr; capped by measured data range
     i_max = max(float(np.max(np.abs(cat.get("iL", ic * 100)))), ic * 10)
@@ -1437,8 +1480,8 @@ with st.sidebar:
         CFG["min_w_ano"]    = st.number_input("Min window points (anodic)", 3, 20, CFG["min_w_ano"])
         CFG["min_w_cat"]    = st.number_input("Min window points (cathodic)", 4, 25, CFG["min_w_cat"])
         CFG["beta_min"]     = st.number_input("β min (V/dec)", 0.005, 0.100, CFG["beta_min"], 0.005, format="%.3f")
-        CFG["beta_max_a"]   = st.number_input("βa max (V/dec)", 0.10, 0.60, CFG["beta_max_a"], 0.01)
-        CFG["beta_max_c"]   = st.number_input("βc max (V/dec)", 0.10, 0.60, CFG["beta_max_c"], 0.01)
+        CFG["beta_max_a"]   = st.number_input("βa max (V/dec)", 0.05, 0.40, CFG["beta_max_a"], 0.005)
+        CFG["beta_max_c"]   = st.number_input("βc max (V/dec)", 0.05, 0.40, CFG["beta_max_c"], 0.005)
 
     st.markdown("**Fitting**")
     force_ct_val = st.selectbox("Force model (auto = best AICc)",
@@ -1691,8 +1734,8 @@ with tab_fit:
                     CR    = icorr_disp * 3.27 * ew_mat / rho_mat
 
                     # Runaway detection (from busbar_tafel_fit.py ba_valid check)
-                    ba_valid = float(p[2]) < 0.495
-                    bc_valid = float(p[3]) < 0.495
+                    ba_valid = float(p[2]) < 0.240   # > 240 mV/dec = unphysical (was 0.495)
+                    bc_valid = float(p[3]) < 0.270   # > 270 mV/dec = unphysical (was 0.495)
                     if not ba_valid or not bc_valid:
                         st.warning(
                             f"⚠️ {'βa' if not ba_valid else ''}"
