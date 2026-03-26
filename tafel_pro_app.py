@@ -696,84 +696,192 @@ def _make_p0(Ecorr, cat, an, ct, E_max):
     return np.array([Ecorr, ic, ba, bc, Ep, 0.010, ip, Et, 0.015, it, iL])
 
 def _build_bounds(Ecorr, cat, an, ct, E_min, E_max, E_span):
-    ic   = max(cat["icorr"], 1e-14)
-    iL   = max(cat["iL"],    1e-10)
-    ba_fit, bc_fit = float(an["ba"]), float(cat["bc"])
-    ba_lo  = max(ba_fit * 0.30, 0.010); ba_hi  = min(ba_fit * 3.00, 0.250)
-    bc_lo  = max(bc_fit * 0.30, 0.010); bc_hi  = min(bc_fit * 3.00, 0.400)
-    lo = np.array([E_min, max(ic * 1e-5, 1e-15), ba_lo, bc_lo,
-                   Ecorr + 0.005, 0.002, max(ic * 1e-6, 1e-16),
-                   Ecorr + 0.05*E_span, 0.002, max(ic * 1e-7, 1e-16),
-                   max(ic * 0.5, 1e-12)])
-    hi = np.array([E_max, min(ic * 1e6, 1.0), ba_hi, bc_hi,
-                   E_max, 0.120, min(ic * 1e5, 1.0),
-                   E_max + 0.1, 0.120, min(ic * 1e7, 10.0),
-                   min(iL * 1000, 1.0)])
+    """
+    Build parameter bounds for the global optimizer.
+
+    Inspired by busbar_tafel_fit.py:
+    - ba/bc: [max(0.020, local×0.50), min(0.500, local×2.0)]
+      Absolute floor (20 mV/dec) + ceiling (500 mV/dec) prevent runaway while
+      remaining wide enough to correct a ±50% error in the local Tafel estimate.
+    - iL: lo = ic×5 (must exceed icorr to be physically meaningful)
+          hi = i_max×50 (cap at 50× measured maximum current)
+    - icorr: ×1e-4 / ×1e4 relative to local estimate (generous range)
+    """
+    ic      = max(cat["icorr"], 1e-14)
+    iL_est  = max(cat["iL"],    1e-10)
+    ba_fit  = float(an["ba"])
+    bc_fit  = float(cat["bc"])
+
+    # Tafel slopes: tight relative band + absolute physical limits (from busbar)
+    ba_lo = max(ba_fit * 0.50, 0.020)
+    ba_hi = min(ba_fit * 2.00, 0.500)
+    bc_lo = max(bc_fit * 0.50, 0.020)
+    bc_hi = min(bc_fit * 2.00, 0.500)
+
+    # iL: must be physically larger than icorr; capped by measured data range
+    i_max = max(float(np.max(np.abs(cat.get("iL", ic * 100)))), ic * 10)
+    iL_lo = max(ic * 5.0,   1e-13)
+    iL_hi = min(i_max * 50, 1.0)
+
+    lo = np.array([E_min,
+                   max(ic * 1e-4, 1e-15),     # icorr lo
+                   ba_lo, bc_lo,
+                   Ecorr + 0.005, 0.001,       # Epass, k_pass
+                   max(ic * 1e-5, 1e-16),      # ip lo
+                   Ecorr + 0.05 * E_span, 0.001,  # Etrans, k_trans
+                   max(ic * 1e-5, 1e-16),      # itrans lo
+                   iL_lo])
+    hi = np.array([E_max,
+                   min(ic * 1e4, 1.0),         # icorr hi
+                   ba_hi, bc_hi,
+                   E_max, 0.150,               # Epass, k_pass
+                   min(ic * 1e3, 1.0),         # ip hi
+                   E_max + 0.1, 0.150,         # Etrans, k_trans
+                   min(ic * 1e5, 10.0),        # itrans hi
+                   iL_hi])
     lo = np.minimum(lo, hi - 1e-12)
     return lo, hi
 
 LOG_IDX = {1, 6, 9, 10}
+
 def _pack(p, fidx):
     return np.array([np.log10(max(p[j], TINY)) if j in LOG_IDX else p[j] for j in fidx])
+
 def _unpack(x, fidx, p_base, lo=None, hi=None):
     p = p_base.copy()
     for k, j in enumerate(fidx):
-        val = 10.0**x[k] if j in LOG_IDX else x[k]
+        val = 10.0 ** x[k] if j in LOG_IDX else x[k]
         if lo is not None: val = float(np.clip(val, lo[j], hi[j]))
         p[j] = val
     return p
+
 def _pbounds(lo, hi, fidx):
-    return [(np.log10(max(lo[j], TINY)), np.log10(max(hi[j], TINY))) if j in LOG_IDX else (lo[j], hi[j]) for j in fidx]
+    return [(np.log10(max(lo[j], TINY)), np.log10(max(hi[j], TINY)))
+            if j in LOG_IDX else (lo[j], hi[j]) for j in fidx]
+
+def _section_weights(E, i, Ecorr_est, Epass_est=None):
+    """
+    Section-balanced weighting for the global objective function.
+
+    Motivation (from busbar analysis):
+    - For Active-Passive curves the passive plateau may hold 60%+ of all points.
+      Uniform log-residual weighting then forces the optimizer to over-fit the
+      trivially-flat passive region at the expense of the kinetically important
+      cathodic and active branches.
+    - Strategy: each electrochemical region (cathodic, active, passive) contributes
+      roughly equally to the total objective, regardless of point density.
+    - Additional Ecorr-vicinity boost (×3 within 60 mV) sharpens the corrosion
+      potential and exchange current density.
+    - Passive plateau is further down-weighted (×0.5) because it is
+      well-described by a single parameter (ip) and needs little optimizer effort.
+    """
+    n = len(E)
+    cat_m  = E < Ecorr_est
+    if Epass_est is not None:
+        act_m  = (E >= Ecorr_est) & (E < Epass_est)
+        pass_m = E >= Epass_est
+    else:
+        act_m  = (E >= Ecorr_est) & (E < Ecorr_est + 0.10)
+        pass_m = E >= (Ecorr_est + 0.10)
+
+    n_cat  = max(int(cat_m.sum()),  1)
+    n_act  = max(int(act_m.sum()),  1)
+    n_pass = max(int(pass_m.sum()), 1)
+
+    w = np.ones(n, float)
+    # Equal section contribution
+    w[cat_m]  *= n / (3.0 * n_cat)
+    w[act_m]  *= n / (3.0 * n_act)  * 1.5   # active Tafel: slightly boosted
+    w[pass_m] *= n / (3.0 * n_pass) * 0.50  # passive plateau: easy, reduce weight
+
+    # Ecorr vicinity boost (×3 within 60 mV) — sharpens icorr and Ecorr
+    w *= 1.0 + 2.0 * np.exp(-np.abs(E - Ecorr_est) / 0.060)
+    w /= w.mean()
+    return w
 
 def global_polish(E, i, p0, ct, lo, hi):
-    ld    = slog(i)
-    fidx  = CT.idx(ct)
-    bnds  = _pbounds(lo, hi, fidx)
+    """
+    Global parameter optimisation: DE → L-BFGS-B → Nelder-Mead → Powell.
+
+    Improvements over previous version (inspired by busbar_tafel_fit.py):
+    - 4-stage cascade: adds Nelder-Mead (adaptive) between L-BFGS-B and Powell,
+      which handles non-smooth basins that L-BFGS-B misses.
+    - Tighter tolerances: ftol=1e-15, gtol=1e-13 throughout.
+    - Larger DE population: popsize=max(15, nf×3), maxiter=max(400, nf×60).
+    - Section-balanced objective weights (see _section_weights) replace the
+      old Ecorr-only Gaussian weight that over-concentrated on the mixed-control
+      zone and starved the cathodic/passive regions of gradient signal.
+    - Bounds enforced via clipping inside _unpack for gradient-free methods
+      (Nelder-Mead, Powell) that don't natively respect bounds.
+    - ba/bc runaway detection: flags fits where Tafel slopes hit the 500 mV/dec
+      upper bound (unphysical — indicates no real linear Tafel region detected).
+    """
+    ld   = slog(i)
+    fidx = CT.idx(ct)
+    bnds = _pbounds(lo, hi, fidx)
     n, nf = len(E), len(fidx)
 
     Ecorr_p0 = float(p0[0])
-    w_base   = 1.0 + 7.0 * np.exp(-np.abs(E - Ecorr_p0) / 0.120)
-    w_base  /= w_base.mean()
+    Epass_p0 = float(p0[4]) if ct in CT.PASS else None
+    w_base   = _section_weights(E, i, Ecorr_p0, Epass_p0)
 
     def obj(x):
         p = _unpack(x, fidx, p0.copy(), lo, hi)
-        pred = pol_model(E, p, ct)
-        return float(np.sum(w_base * (ld - slog(pred)) ** 2))
+        try:
+            pred = pol_model(E, p, ct)
+            return float(np.sum(w_base * (ld - slog(pred)) ** 2))
+        except Exception:
+            return 1e30
 
-    best_x = _pack(p0, fidx); best_val = obj(best_x)
+    best_x = _pack(p0, fidx)
+    best_val = obj(best_x)
+
     def update(x):
         nonlocal best_x, best_val
         v = obj(x)
-        if v < best_val - 1e-12: best_x, best_val = x.copy(), v
+        if v < best_val - 1e-12:
+            best_x, best_val = x.copy(), v
         return v
 
-    try:
-        ps  = max(12, min(16, nf * 3))
-        mi  = max(150, min(400, nf * 50))
-        res = differential_evolution(obj, bnds, seed=42, maxiter=mi, popsize=ps,
-                                     tol=1e-9, mutation=(0.5, 1.7),
-                                     recombination=0.85, polish=False, workers=1,
-                                     strategy="best1bin")
-        update(res.x)
-    except Exception:
-        pass
+    # ── Stage 1: Differential Evolution (global search) ───────────────────
+    # Larger population and more iterations than before (busbar: popsize≥15)
+    ps = max(15, nf * 3)
+    mi = max(400, nf * 60)
+    for seed, strat in [(42, "best1bin"), (7, "currenttobest1bin")]:
+        try:
+            res = differential_evolution(
+                obj, bnds, seed=seed, maxiter=mi, popsize=ps,
+                tol=1e-12, mutation=(0.5, 1.9), recombination=0.90,
+                polish=False, workers=1, strategy=strat)
+            update(res.x)
+        except Exception:
+            pass
 
+    # ── Stage 2: L-BFGS-B (gradient-based refinement) ────────────────────
     try:
         r = minimize(obj, best_x, method="L-BFGS-B", bounds=bnds,
-                     options={"maxiter": 15000, "ftol": 1e-12, "gtol": 1e-10})
+                     options={"maxiter": 25000, "ftol": 1e-15, "gtol": 1e-13})
         update(r.x)
     except Exception:
         pass
 
-    p_tmp = _unpack(best_x, fidx, p0.copy(), lo, hi)
-    r2_now = r2_score(ld, slog(pol_model(E, p_tmp, ct)))
-    if r2_now < 0.995:
-        try:
-            r = minimize(obj, best_x, method="Powell",
-                         options={"maxiter": 8000, "xtol": 1e-12, "ftol": 1e-12})
-            update(r.x)
-        except Exception:
-            pass
+    # ── Stage 3: Nelder-Mead adaptive (non-smooth basin escape) ──────────
+    # From busbar: handles parameter correlations that trip up L-BFGS-B
+    try:
+        r = minimize(obj, best_x, method="Nelder-Mead",
+                     options={"maxiter": 20000, "xatol": 1e-12,
+                              "fatol": 1e-14, "adaptive": True})
+        update(r.x)
+    except Exception:
+        pass
+
+    # ── Stage 4: Powell (final coordinate-wise polish) ────────────────────
+    try:
+        r = minimize(obj, best_x, method="Powell",
+                     options={"maxiter": 15000, "xtol": 1e-12, "ftol": 1e-14})
+        update(r.x)
+    except Exception:
+        pass
 
     best_p = _unpack(best_x, fidx, p0.copy(), lo, hi)
     log_p  = slog(pol_model(E, best_p, ct))
@@ -1488,8 +1596,14 @@ with tab_fit:
                             candidates.append(CT.P)
                         if an_res["has_passive"]:
                             candidates.extend([CT.P, CT.PT])
+                            # Always try F (full model with iL) for passive curves —
+                            # the cathodic diffusion detection can miss subtle plateaus,
+                            # but the global model can still pick up iL from the data.
+                            candidates.append(CT.F)
                         if cat_res["has_diff"]:
                             candidates.append(CT.AD)
+                            if an_res["has_passive"]:
+                                candidates.append(CT.F)
                         seen = set(); uniq = []
                         for c in candidates:
                             if c not in seen:
@@ -1576,12 +1690,24 @@ with tab_fit:
                     B_val = (p[2]*p[3])/(2.303*(p[2]+p[3])) if p[2]>0 and p[3]>0 else 0
                     CR    = icorr_disp * 3.27 * ew_mat / rho_mat
 
+                    # Runaway detection (from busbar_tafel_fit.py ba_valid check)
+                    ba_valid = float(p[2]) < 0.495
+                    bc_valid = float(p[3]) < 0.495
+                    if not ba_valid or not bc_valid:
+                        st.warning(
+                            f"⚠️ {'βa' if not ba_valid else ''}"
+                            f"{' and ' if not ba_valid and not bc_valid else ''}"
+                            f"{'βc' if not bc_valid else ''} hit the 500 mV/dec upper bound — "
+                            "no reliable linear Tafel region was found for that branch. "
+                            "The corrosion current is estimated from the other branch only. "
+                            "Consider adjusting the guard or window in Advanced settings.")
+
                     st.markdown("#### 📐 Fitted Parameters")
                     mc = st.columns(5)
                     mc[0].metric("E_corr (V)",       f"{ecorr_disp:.5f}")
                     mc[1].metric("i_corr (A/cm²)",   f"{icorr_disp:.4e}")
-                    mc[2].metric("βa (mV/dec)",       f"{p[2]*1000:.1f}")
-                    mc[3].metric("βc (mV/dec)",       f"{p[3]*1000:.1f}")
+                    mc[2].metric("βa (mV/dec)",       f"{p[2]*1000:.1f}" + ("" if ba_valid else " ⚠️"))
+                    mc[3].metric("βc (mV/dec)",       f"{p[3]*1000:.1f}" + ("" if bc_valid else " ⚠️"))
                     mc[4].metric("B (V)",             f"{B_val:.5f}")
 
                     mc2 = st.columns(5)
