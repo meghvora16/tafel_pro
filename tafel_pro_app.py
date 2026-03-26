@@ -491,7 +491,10 @@ def fit_anodic(E, i, Ecorr):
 
     if len(Ea) > 6:
         # Smooth first for robust derivative and peak detection
-        w_pk = max(5, min(15, len(Ea) // 2 * 2 - 1))
+        # Cap at 9: a 15-point window over-smooths the narrow active peak
+        # (e.g. 8 pts wide), shifting the detected Epeak rightward into the
+        # passive transition zone and inflating ba (image gave ba=184 vs ~95 true).
+        w_pk = max(5, min(9, len(Ea) // 2 * 2 - 1))
         lgia_pk = savgol_filter(lgia, w_pk, 3, mode="interp")
         dY_pk   = np.gradient(lgia_pk, Ea)
 
@@ -501,30 +504,60 @@ def fit_anodic(E, i, Ecorr):
         cands = [Ea[k] for k in sign_chg
                  if Ea[k] > Ecorr + 0.005 and Ea[k] < Ea[-1] - 0.05]
         if cands:
-            # Pick the first peak above Ecorr (closest to Ecorr = active peak)
-            Epeak_detected = float(min(cands))
+            # Prefer the first candidate within the expected active zone
+            # (within 200 mV of Ecorr). This prevents noise sign-changes in
+            # the passive/transpassive region from being mistaken for the
+            # active dissolution peak (which caused ba=184 on the image data).
+            active_cands = [c for c in cands if c < Ecorr + 0.200]
+            Epeak_detected = float(min(active_cands)) if active_cands else float(min(cands))
 
-        # SECONDARY: find_peaks with reduced prominence (was 0.3, now 0.10)
-        # catches genuine peaks missed by the derivative method on noisy data
+        # SECONDARY: find_peaks with reduced prominence
+        # Same 200mV active-zone filter applied for consistency.
         if Epeak_detected is None:
-            pks, _ = find_peaks(lgia_pk, prominence=0.10, distance=2)
-            pks_above = [p for p in pks if Ea[p] > Ecorr + 0.005]
-            if pks_above:
-                # closest to Ecorr among peaks
-                pk = min(pks_above, key=lambda p: abs(Ea[p] - Ecorr))
+            pks, _ = find_peaks(lgia_pk, prominence=0.08, distance=2)
+            pks_active = [p for p in pks
+                          if Ecorr + 0.005 < Ea[p] < Ecorr + 0.200]
+            if pks_active:
+                pk = min(pks_active, key=lambda p: abs(Ea[p] - Ecorr))
                 Epeak_detected = float(Ea[pk])
+            elif len(pks) > 0:
+                pks_above = [p for p in pks if Ea[p] > Ecorr + 0.005]
+                if pks_above:
+                    pk = min(pks_above, key=lambda p: abs(Ea[p] - Ecorr))
+                    Epeak_detected = float(Ea[pk])
 
     if len(Ea) > 8:
         lgia_sm = savgol_filter(lgia, max(5, min(11, len(Ea) // 2 * 2 - 1)), 3, mode="interp")
         dlg     = np.gradient(lgia_sm, Ea); adlg = np.abs(dlg)
-        thr     = max(np.percentile(adlg, 30), 0.8)
-        flat    = adlg < thr
+
+        # ── Robust passive threshold (fixes ba=184/no-passive on real data) ──
+        # OLD: thr = max(percentile_30, 0.80) — the hard floor of 0.80 fails when:
+        #   (a) the passive plateau slope (0.68 dec/V) is below 0.80 but not
+        #       consistently, due to noise breaking the flat run, OR
+        #   (b) the percentile_30 itself is high (e.g. 6 dec/V for active-dominated
+        #       curves), making thr=6 and nothing looks flat.
+        #
+        # NEW: Use TWO thresholds and take the union:
+        #   1. Relative: thr_rel = percentile_10 * 4.0
+        #      (4× the quietest 10% of the derivative — passive is much flatter
+        #       than the active/transpassive wings even for gradual transitions)
+        #   2. Absolute: thr_abs = 2.0 dec/V
+        #      (passive plateau rarely exceeds 2 dec/V; active/transpassive do)
+        # A point is "flat" if EITHER condition holds.
+        # This reliably detects the passive plateau regardless of overall curve shape.
+        p10 = np.percentile(adlg, 10)
+        thr_rel = p10 * 4.0    # 4× quietest region
+        thr_abs = 2.0           # absolute ceiling for passive slope
+        # Use the SMALLER of the two (most selective that still finds flat regions)
+        # but ensure it's at least as large as the relative threshold
+        thr = max(thr_rel, min(thr_abs, np.percentile(adlg, 25)))
+        flat = adlg < thr
 
         runs = [(k, list(g)) for k, g in groupby(enumerate(flat), key=lambda x: x[1]) if k]
         for _, ri in runs:
             idxs = [s[0] for s in ri]
             span = abs(Ea[idxs[-1]] - Ea[idxs[0]])
-            if len(idxs) >= 4 and span > 0.06:
+            if len(idxs) >= 4 and span > 0.05:
                 ip_cand = float(np.median(np.abs(i[ano][si][idxs])))
                 if ip_cand < float(np.max(np.abs(i[ano]))) * 0.7:
                     has_passive = True
@@ -534,7 +567,12 @@ def fit_anodic(E, i, Ecorr):
                     if np.sum(post) > 3:
                         post_dlg = dlg[np.where(post)[0]]
                         post_E   = Ea[np.where(post)[0]]
-                        rising   = np.where(post_dlg > 3.0)[0]
+                        # Transpassive: use relative threshold (3× local passive slope)
+                        # OLD: post_dlg > 3.0 (absolute) — missed gentle transpassive
+                        # Transpassive threshold: use fixed 1.5 dec/V minimum
+                        # (was 3×thr which over-scales when thr is large)
+                        trans_thr = max(thr, 1.5)
+                        rising   = np.where(post_dlg > trans_thr)[0]
                         if len(rising) > 0:
                             has_trans = True
                             Etrans    = float(post_E[rising[0]])
@@ -559,6 +597,30 @@ def fit_anodic(E, i, Ecorr):
         E_upper = Epeak_detected        # tightest: stop at the active peak
     elif has_passive and Epass is not None:
         E_upper = Epass                 # fallback: stop at passivation onset
+    else:
+        # Last-resort fallback: derivative-drop bound.
+        # When neither a distinct Epeak nor a flat passive plateau is found
+        # (e.g. gradual monotone rise into passive with no local maximum),
+        # find where the local derivative drops to < 40% of its peak value.
+        # That transition marks the end of the steep active Tafel zone.
+        # Without this, the window extends far into the passive/transpassive
+        # region, inflating ba (e.g. producing ba=184 mV/dec on the image curve).
+        _w_tmp = max(5, min(11, len(Ea)//2*2-1))
+        _Y_tmp = savgol_filter(lgia, _w_tmp, 3, mode="interp")
+        _dY_tmp = np.abs(np.gradient(_Y_tmp, Ea))
+        # Only look within first 300 mV of anodic range for the active peak
+        _near_mask = (Ea > Ecorr + CFG["anod_guard"]) & (Ea < Ecorr + 0.30)
+        if np.sum(_near_mask) >= 4:
+            _max_slope = float(np.max(_dY_tmp[_near_mask]))
+            _drop_thr  = 0.40 * _max_slope
+            # Find first SUSTAINED drop below 40% (2+ consecutive points)
+            _cands = np.where(_dY_tmp < _drop_thr)[0]
+            for _k in range(len(_cands) - 1):
+                _idx = _cands[_k]
+                if (_cands[_k+1] == _idx + 1
+                        and Ea[_idx] > Ecorr + 0.020):
+                    E_upper = float(Ea[_idx])
+                    break
 
     if E_upper is not None:
         active_mask = base_mask & (Ea <= E_upper)
@@ -587,7 +649,7 @@ def fit_anodic(E, i, Ecorr):
     # extended into the passive drop where apparent slope ≈ 0, i.e. ba >> 250.
     first_neg_run = None
     for _k in range(len(dY) - 2):
-        if dY[_k] < 0 and dY[_k + 1] < 0:   # two consecutive negatives = descent
+        if dY[_k] < 0 and dY[_k + 1] < 0 and dY[min(_k+2, len(dY)-1)] < 0:   # three consecutive negatives = descent
             first_neg_run = _k
             break
     if first_neg_run is not None and first_neg_run >= CFG["min_w_ano"]:
