@@ -452,7 +452,7 @@ def fit_cathodic(E, i, Ecorr):
 
     return dict(
         bc=bc, icorr=icorr, iL=iL, has_diff=has_diff,
-        r2=float(max(r2_win, float(np.max(R2)) if len(R2) else 0.0)),
+        r2=float(r2_win),
         E_cat=Ec, lgi_cat=lgi,
         slope_c=sl_ref, intercept_c=b_ref, win_c=(Ex[s0], Ex[s1 - 1])
     )
@@ -665,100 +665,102 @@ def fit_anodic(E, i, Ecorr):
             dY  = np.gradient(Y_sm2, Ex)
             d2Y = np.gradient(dY, Ex)
 
-    s_idx, e_idx, slope, intercept, R2 = _sliding_regress_full(
-        Ex, Yx, min_len=CFG["min_w_ano"], max_len=20)
-    if len(slope) == 0:
-        return dict(ba=0.060, has_passive=has_passive, Epass=Epass, ip=ip,
-                    has_trans=has_trans, Etrans=Etrans, Epeak=Epeak_detected,
-                    r2=0.0, E_an=Ea, lgi_an=lgia)
+    # ── Anodic Tafel slope estimation ────────────────────────────────────────
+    # The active window is already bounded by Epeak or Epass, so ALL points in
+    # Ex belong to the active dissolution region. The task is simply to find
+    # the STEEPEST linear sub-segment within Ex — that is the Tafel slope.
+    #
+    # Previous approach used proximity-to-Ecorr scoring which incorrectly
+    # rewarded passive-transition windows near Ecorr over the true steep Tafel
+    # region (producing ba=184 instead of ~95 mV/dec on the image data).
+    #
+    # New approach:
+    #   • Sparse active zone (≤12 pts): use full-window OLS/Theil-Sen.
+    #     Sub-window selection is unreliable with few noisy points.
+    #   • Dense active zone (>12 pts): sliding window, scored purely by
+    #     |slope| magnitude (steepest = most Tafel-like) and R².
+    #     No proximity term — the E_upper bound already ensures we're in the
+    #     correct zone.
 
-    # Clamp indices to trimmed array length
-    n_trim = len(dY)
-    s_idx_c = np.minimum(s_idx, n_trim - 1)
-    e_idx_c = np.minimum(e_idx, n_trim)
-    valid   = e_idx_c > s_idx_c
-    if not np.any(valid):
-        s_idx_c = s_idx; e_idx_c = e_idx; valid = np.ones(len(s_idx), bool)
-    max_d2 = np.array([np.max(np.abs(d2Y[s:max(s+1,e)])) for s, e in zip(s_idx_c[valid], e_idx_c[valid])])
-    # Pad back to full length for consistent indexing
-    max_d2_full = np.full(len(slope), max_d2.max() if len(max_d2) else 0.0)
-    max_d2_full[valid] = max_d2
-    max_d2 = max_d2_full
+    if len(Ex) <= 12:
+        # ── Sparse path: fit all active points directly ───────────────────
+        # With few points a sub-window just picks the flattest local segment.
+        # Use the full window — Theil-Sen is robust against 1-2 noise outliers.
+        sl_ts, b_ts = _theil_sen(Ex, Yx)
+        sl_ols, b_ols = _theil_sen(Ex, Yx)          # same for OLS start
+        sl_hb, b_hb = _huber_fit(Ex, Yx, sl_ts, b_ts)
 
-    def _mono_frac(s, e):
-        seg = dY[s:e]
-        return float(np.mean(seg > 0)) if len(seg) else 0.0   # log|i| increases as E↑
-    mono = np.array([_mono_frac(s, e) for s, e in zip(s_idx, e_idx)])
+        def _r2_full(sl, b):
+            return r2_score(Yx, sl * Ex + b)
+        cand = [(sl_ts, b_ts, _r2_full(sl_ts, b_ts)),
+                (sl_hb, b_hb, _r2_full(sl_hb, b_hb))]
+        sl_ref, b_ref, r2_win = max(cand, key=lambda t: t[2])
 
-    invm    = np.where(np.abs(slope) > 1e-12, 1.0 / np.abs(slope), np.inf)
-    # HARD GATE: physical Tafel slope range
-    beta_ok = (slope > 0) & (invm > CFG["beta_min"]) & (invm < CFG["beta_max_a"])
-    curv_ok = max_d2 < CFG["curvature_max"]
-    mono_ok = mono >= CFG["lin_frac"]
+        # Ensure the slope is physically sensible
+        if sl_ref <= 0 or abs(1.0 / sl_ref) > CFG["beta_max_a"] * 1.5:
+            sl_ref = sl_ts
+            b_ref  = b_ts
+            r2_win = _r2_full(sl_ref, b_ref)
 
-    # Primary candidates: pass all quality gates
-    ok = beta_ok & curv_ok & mono_ok & (R2 > 0.80)
+        ba = min(abs(1.0 / sl_ref), CFG["beta_max_a"]) if abs(sl_ref) > 1e-9 else 0.060
+        win_e0, win_e1 = float(Ex[0]), float(Ex[-1])
 
-    # Fallback tier 1: relax curvature/mono, keep beta hard gate and R2
-    if not np.any(ok):
-        ok = beta_ok & (R2 > 0.70)
-
-    # Fallback tier 2: beta_ok only (any R2)
-    if not np.any(ok):
-        ok = beta_ok.copy()
-
-    # Scoring — HARD ZERO for windows failing beta_ok (passive plateau killer)
-    E_start  = Ex[s_idx]
-    clos     = np.exp(-np.abs(E_start - Ecorr) / 0.20)   # proximity to Ecorr
-    curv_pen = np.exp(-max_d2 / max(CFG["curvature_max"], 10.0))
-    score    = (R2 ** 2) * clos * np.clip(mono, 0.2, 1.0) * curv_pen
-
-    # CRITICAL FIX: hard-zero windows outside beta range (was *= 0.15)
-    score[~beta_ok] = 0.0
-    # Soft penalty only for curvature/mono violations within the beta_ok set
-    score[beta_ok & ~(curv_ok & mono_ok)] *= 0.30
-
-    # If scoring collapses (all zeros), use derivative-based fallback for
-    # very narrow active zones (e.g. stainless steel with instant passivation).
-    # FIX E: find the steepest consistently rising portion using the smoothed
-    # derivative instead of relying on sliding window regression.
-    if np.all(score == 0.0):
-        # Try: pick the window with the steepest positive slope among beta_ok
-        beta_ok_slopes = np.where(beta_ok, slope, 0.0)
-        if np.any(beta_ok):
-            k_best = int(np.argmax(beta_ok_slopes))
-        else:
-            # Last resort: steepest positive-slope window regardless of beta
-            pos_slope_mag = np.where(slope > 0, slope, 0.0)
-            k_best = int(np.argmax(pos_slope_mag))
     else:
-        k_best = int(np.argmax(score))
+        # ── Dense path: sliding window, steep-slope scoring ───────────────
+        s_idx, e_idx, slope, intercept, R2 = _sliding_regress_full(
+            Ex, Yx, min_len=CFG["min_w_ano"], max_len=20)
+        if len(slope) == 0:
+            return dict(ba=0.060, has_passive=has_passive, Epass=Epass, ip=ip,
+                        has_trans=has_trans, Etrans=Etrans, Epeak=Epeak_detected,
+                        r2=0.0, E_an=Ea, lgi_an=lgia)
 
-    s0, s1   = int(s_idx[k_best]), int(e_idx[k_best])
-    sl_ols, b_ols = float(slope[k_best]), float(intercept[k_best])
+        invm    = np.where(np.abs(slope) > 1e-12, 1.0 / np.abs(slope), np.inf)
+        beta_ok = (slope > 0) & (invm > CFG["beta_min"]) & (invm < CFG["beta_max_a"])
 
-    sl_ts, b_ts = _theil_sen(Ex[s0:s1], Yx[s0:s1])
-    sl_hb, b_hb = _huber_fit(Ex[s0:s1], Yx[s0:s1], sl_ols, b_ols)
+        # Score by R² × window-length.
+        # R² captures linearity (the true Tafel region is most linear).
+        # Length rewards longer stable segments over short noisy ones.
+        # No proximity or steepness bias — these caused wrong window
+        # selection in both simple-active (steep bias picked mixed-control
+        # zone near Ecorr) and active-passive (proximity bias picked passive
+        # transition zone away from Ecorr).
+        win_len_a    = (e_idx - s_idx).astype(float)
+        len_bonus_a  = np.log1p(win_len_a) / np.log1p(25.0)  # normalised [0,1]
+        score        = (R2 ** 2) * (0.6 + 0.4 * len_bonus_a)
+        score[~beta_ok] = 0.0      # hard zero for unphysical slopes
 
-    def _r2_line(sl, b):
-        return r2_score(Yx[s0:s1], sl * Ex[s0:s1] + b)
-    cand = [(sl_ts, b_ts, _r2_line(sl_ts, b_ts)),
-            (sl_hb, b_hb, _r2_line(sl_hb, b_hb)),
-            (sl_ols, b_ols, _r2_line(sl_ols, b_ols))]
-    sl_ref, b_ref, r2_win = max(cand, key=lambda t: t[2])
+        if np.all(score == 0.0):
+            pos_mag = np.where(slope > 0, slope, 0.0)
+            k_best  = int(np.argmax(pos_mag))
+        else:
+            k_best  = int(np.argmax(score))
 
-    # Guard: refinement must not drift to flat/negative slope
-    if sl_ref <= 0 or abs(1.0 / sl_ref) > CFG["beta_max_a"] * 1.5:
-        sl_ref, b_ref = sl_ols, b_ols
+        s0, s1 = int(s_idx[k_best]), int(e_idx[k_best])
+        sl_ols, b_ols = float(slope[k_best]), float(intercept[k_best])
 
-    ba = min(abs(1.0 / sl_ref), CFG["beta_max_a"]) if abs(sl_ref) > 1e-9 else 0.060
+        sl_ts, b_ts = _theil_sen(Ex[s0:s1], Yx[s0:s1])
+        sl_hb, b_hb = _huber_fit(Ex[s0:s1], Yx[s0:s1], sl_ols, b_ols)
+
+        def _r2_line(sl, b):
+            return r2_score(Yx[s0:s1], sl * Ex[s0:s1] + b)
+        cand = [(sl_ts, b_ts, _r2_line(sl_ts, b_ts)),
+                (sl_hb, b_hb, _r2_line(sl_hb, b_hb)),
+                (sl_ols, b_ols, _r2_line(sl_ols, b_ols))]
+        sl_ref, b_ref, r2_win = max(cand, key=lambda t: t[2])
+
+        if sl_ref <= 0 or abs(1.0 / sl_ref) > CFG["beta_max_a"] * 1.5:
+            sl_ref, b_ref = sl_ols, b_ols
+            r2_win = _r2_line(sl_ref, b_ref)
+
+        ba = min(abs(1.0 / sl_ref), CFG["beta_max_a"]) if abs(sl_ref) > 1e-9 else 0.060
+        win_e0, win_e1 = float(Ex[s0]), float(Ex[s1 - 1])
 
     return dict(
         ba=ba, has_passive=has_passive, Epass=Epass, ip=ip,
         has_trans=has_trans, Etrans=Etrans, Epeak=Epeak_detected,
-        r2=float(max(r2_win, float(np.max(R2)) if len(R2) else 0.0)),
+        r2=float(r2_win),
         E_an=Ea, lgi_an=lgia,
-        slope_a=sl_ref, intercept_a=b_ref, win_a=(Ex[s0], Ex[s1 - 1])
+        slope_a=sl_ref, intercept_a=b_ref, win_a=(win_e0, win_e1)
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
