@@ -28,6 +28,13 @@ Run:
 """
 
 import streamlit as st
+
+# ── VERSION STAMP ────────────────────────────────────────────────────────────
+_APP_VERSION = "2025-CorrAssist-v3.1-PolCurveFit"
+# If you see bc=233 / R²=0.00000, you are running a CACHED OLD VERSION.
+# Fix: press Ctrl+C in the terminal → python -c "import sys; [sys.modules.pop(k) for k in list(sys.modules)]" is not needed.
+# Just: Ctrl+C then: streamlit run app.py --server.runOnSave true
+# ─────────────────────────────────────────────────────────────────────────────
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -1386,6 +1393,7 @@ for _k in ("results", "figures"):
 # SIDEBAR
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
+    st.caption(f"🔖 {_APP_VERSION}")
     st.markdown("## ⚙️ Configuration")
     st.divider()
     st.markdown("**Material**")
