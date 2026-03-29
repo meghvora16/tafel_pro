@@ -1,8 +1,9 @@
 # app.py
-# Polarization Curve Fitter — Publication-Grade Streamlit App (Refined)
-# - Refined anodic active-region detector (derivative plateau scoring)
-# - Objective region classification (flat-run tests on d(log|i|)/dE)
-# - Robust bounded least-squares global fit (soft-L1) with section-balanced weights
+# Polarization Curve Fitter — Fully Automatic Build
+# - Auto-tunes Tafel detection hyperparameters per dataset (default)
+# - Tries all curve models (A, AD, P, PT, F) and selects by AICc
+# - Robust bounded least-squares (soft-L1) global fitting
+# - Publication-grade figure and exports
 
 import streamlit as st
 import numpy as np
@@ -15,7 +16,7 @@ from matplotlib.ticker import AutoMinorLocator
 import io, zipfile, warnings, traceback, re
 from itertools import groupby
 
-from scipy.optimize import differential_evolution, minimize, least_squares
+from scipy.optimize import least_squares
 from scipy.signal import savgol_filter, find_peaks
 
 import openpyxl
@@ -46,7 +47,7 @@ st.markdown("""
 </style>""", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONSTANTS & CONFIG
+# CONSTANTS & DEFAULT CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 TINY    = 1e-30
 PALETTE = ["#2e86de","#e84393","#27ae60","#e67e22","#8e44ad","#16a085","#c0392b"]
@@ -69,7 +70,7 @@ MATERIALS = {
     "Zinc":                  (32.69, 7.14),
 }
 
-# Global detection settings (overridden by sidebar "Advanced")
+# Conservative, physically-plausible defaults (used when Auto is off)
 CFG = dict(
     cath_guard=0.020,      # V — min distance of cathodic window from Ecorr
     anod_guard=0.010,      # V — min distance of anodic window from Ecorr
@@ -81,6 +82,7 @@ CFG = dict(
     beta_max_c=0.280,      # 280 mV/dec cathodic cap
     beta_max_a=0.250,      # 250 mV/dec anodic cap
 )
+CFG_DEFAULT = dict(CFG)    # snapshot of defaults
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPER MATH
@@ -253,7 +255,139 @@ def _theil_sen(x, y):
     return slope, intercept
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STAGE 2 — CATHODIC BRANCH FIT (as in v2, kept stable)
+# OBJECTIVE REGION CHECKS (derivative-based)
+# ─────────────────────────────────────────────────────────────────────────────
+def _derivative_based_regions(E, i, Ecorr):
+    """Return objective region booleans and markers based on smoothed derivatives."""
+    E = np.asarray(E, float); lg = slog(i)
+    w = max(5, min(11, len(E)//2*2-1))
+    lg_sm = savgol_filter(lg, w, 3, mode="interp")
+    dY = np.gradient(lg_sm, E); adY = np.abs(dY)
+
+    # Passive detection on anodic side
+    ano = E > Ecorr + 0.005
+    has_passive, Epass, ip = False, None, None
+    has_trans, Etrans = False, None
+
+    if np.sum(ano) > 8:
+        Ea, adya, dya = E[ano], adY[ano], dY[ano]
+        p10 = np.percentile(adya, 10)
+        thr_rel = p10 * 4.0
+        thr_abs = 2.0
+        thr = max(thr_rel, min(thr_abs, np.percentile(adya, 25)))
+        flat = adya < thr
+        runs = [(k, list(g)) for k, g in groupby(enumerate(flat), key=lambda x: x[1]) if k]
+        for _, ri in runs:
+            idxs = [s[0] for s in ri]
+            span = abs(Ea[idxs[-1]] - Ea[idxs[0]])
+            if len(idxs) >= 4 and span > 0.05:
+                has_passive = True
+                Epass = float(Ea[idxs[0]])
+                ip = float(np.median(np.abs(i[ano][idxs])))
+                post = np.where(Ea > Ea[idxs[-1]])[0]
+                if len(post) >= 3:
+                    dpost = adya[post]
+                    Eth = max(thr, 1.5)
+                    rising = np.where(dpost > Eth)[0]
+                    if len(rising) > 0:
+                        has_trans = True
+                        Etrans = float(Ea[post[rising[0]]])
+                break
+
+    # Cathodic diffusion flat-run
+    cat = E < Ecorr - 0.005
+    has_diff = False
+    if np.sum(cat) > 8:
+        Ec, adyc = E[cat], adY[cat]
+        thr_c = max(np.percentile(adyc, 30), 0.5)
+        flatc = adyc < thr_c
+        runs_c = [(k, list(g)) for k, g in groupby(enumerate(flatc), key=lambda x: x[1]) if k]
+        if runs_c:
+            idxs = [s[0] for s in max(runs_c, key=lambda x: len(x[1]))[1]]
+            if len(idxs) >= 3 and abs(Ec[idxs[-1]] - Ec[idxs[0]]) > 0.03:
+                has_diff = True
+
+    return dict(
+        has_passive=has_passive, Epass=Epass, ip=ip,
+        has_trans=has_trans, Etrans=Etrans,
+        has_diff=has_diff
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTO-TUNER FOR ADVANCED SETTINGS (per dataset)
+# ─────────────────────────────────────────────────────────────────────────────
+def auto_tune_cfg(E, i):
+    """
+    Tune detection hyperparameters from data characteristics:
+      - Noise/roughness → curvature_max, lin_frac
+      - Sampling density → min_w_* per branch
+      - Curvature near Ecorr → anod/cath guards
+      - Presence of diffusion/passive → widen guards / curvature cap
+    Returns: (cfg_dict, notes_list)
+    """
+    cfg = dict(CFG_DEFAULT)  # start from conservative defaults
+    notes = []
+
+    # Basic derivatives
+    Ecorr, _ = detect_ecorr(E, i)
+    lg_raw = slog(i)
+    w = max(5, min(11, len(E)//2*2-1))
+    lg_sm = savgol_filter(lg_raw, w, 3, mode="interp") if len(E) >= 5 else lg_raw.copy()
+    d1_raw = np.gradient(lg_raw, E)
+    d1_sm  = np.gradient(lg_sm, E)
+    d2_sm  = np.gradient(d1_sm, E) if len(E) >= 5 else np.zeros_like(E)
+
+    # Roughness ratio: how noisy derivatives are vs smoothed trend
+    rr = np.median(np.abs(d1_raw - d1_sm)) / (np.median(np.abs(d1_sm)) + 1e-9)
+    if rr > 0.35:
+        cfg["curvature_max"] = 90.0
+        cfg["lin_frac"] = 0.60
+        notes.append("High noise detected (roughness ratio > 0.35): curvature_max=90, linearity=0.60")
+    elif rr > 0.20:
+        cfg["curvature_max"] = 60.0
+        cfg["lin_frac"] = 0.65
+        notes.append("Moderate noise (0.20–0.35): curvature_max=60, linearity=0.65")
+    else:
+        cfg["curvature_max"] = 40.0
+        cfg["lin_frac"] = 0.70
+        notes.append("Low noise (<0.20): curvature_max=40, linearity=0.70")
+
+    # Curvature near Ecorr to position guards
+    near_cath = (E < Ecorr) & (E > Ecorr - 0.08)
+    near_ano  = (E > Ecorr) & (E < Ecorr + 0.08)
+    curv_c = float(np.median(np.abs(d2_sm[near_cath]))) if np.any(near_cath) else 0.0
+    curv_a = float(np.median(np.abs(d2_sm[near_ano])))  if np.any(near_ano)  else 0.0
+
+    cfg["cath_guard"] = 0.025 if curv_c > cfg["curvature_max"]/2 else 0.015
+    cfg["anod_guard"] = 0.015 if curv_a > cfg["curvature_max"]/2 else 0.010
+    notes.append(f"Ecorr vicinity curvature: cath={curv_c:.1f}, ano={curv_a:.1f} → guards set to {cfg['cath_guard']:.3f}/{cfg['anod_guard']:.3f} V")
+
+    # Sampling density → minimal window sizes
+    N_cat = int(np.sum((E < Ecorr - 0.005) & (i < 0)))
+    N_ano = int(np.sum((E > Ecorr + 0.005) & (i > 0)))
+    cfg["min_w_cat"] = max(4, min(8, max(4, N_cat // 6))) if N_cat >= 6 else 4
+    cfg["min_w_ano"] = max(3, min(8, max(3, N_ano // 6))) if N_ano >= 6 else 3
+    notes.append(f"Sampling: N_cat={N_cat}, N_ano={N_ano} → min_w_cat={cfg['min_w_cat']}, min_w_ano={cfg['min_w_ano']}")
+
+    # Diffusion/passive presence → widen guards / curvature cap
+    reg = _derivative_based_regions(E, i, Ecorr)
+    if reg["has_diff"]:
+        cfg["cath_guard"] = max(cfg["cath_guard"], 0.025)
+        cfg["curvature_max"] = max(cfg["curvature_max"], 90.0)
+        notes.append("Cathodic diffusion signature: increased cath_guard to ≥0.025 V and curvature_max to ≥90")
+    if reg["has_passive"]:
+        cfg["anod_guard"] = max(cfg["anod_guard"], 0.010)
+        notes.append("Passive plateau detected: anod_guard kept conservative (≥0.010 V)")
+
+    # Keep physically-plausible Tafel caps
+    cfg["beta_min"]   = 0.020
+    cfg["beta_max_a"] = 0.250
+    cfg["beta_max_c"] = 0.280
+
+    return cfg, notes
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CATHODIC BRANCH FIT (unchanged from robust v2)
 # ─────────────────────────────────────────────────────────────────────────────
 def fit_cathodic(E, i, Ecorr):
     cat = i < 0
@@ -372,77 +506,9 @@ def fit_cathodic(E, i, Ecorr):
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Utility: objective flat-run tests on d(log|i|)/dE (PolCurveFit-style)
-# ─────────────────────────────────────────────────────────────────────────────
-def _derivative_based_regions(E, i, Ecorr):
-    """Return objective region booleans and markers based on smoothed derivatives."""
-    E = np.asarray(E, float); lg = slog(i)
-    w = max(5, min(11, len(E)//2*2-1))
-    lg_sm = savgol_filter(lg, w, 3, mode="interp")
-    dY = np.gradient(lg_sm, E); adY = np.abs(dY)
-
-    # Passive detection on anodic side: long flat run of small |dY/dE|
-    ano = E > Ecorr + 0.005
-    has_passive, Epass, ip = False, None, None
-    has_trans, Etrans = False, None
-
-    if np.sum(ano) > 8:
-        Ea, adya, dya, lga = E[ano], adY[ano], dY[ano], lg_sm[ano]
-        p10 = np.percentile(adya, 10)
-        thr_rel = p10 * 4.0
-        thr_abs = 2.0
-        thr = max(thr_rel, min(thr_abs, np.percentile(adya, 25)))
-        flat = adya < thr
-        runs = [(k, list(g)) for k, g in groupby(enumerate(flat), key=lambda x: x[1]) if k]
-        for _, ri in runs:
-            idxs = [s[0] for s in ri]
-            span = abs(Ea[idxs[-1]] - Ea[idxs[0]])
-            if len(idxs) >= 4 and span > 0.05:
-                has_passive = True
-                Epass = float(Ea[idxs[0]])
-                # ip from original data (not smoothed)
-                ip = float(np.median(np.abs(i[ano][idxs])))
-                # Transpassive: post-passive derivative rise
-                post = np.where(Ea > Ea[idxs[-1]])[0]
-                if len(post) >= 3:
-                    dpost = dya[post]
-                    Eth = max(thr, 1.5)
-                    rising = np.where(dpost > Eth)[0]
-                    if len(rising) > 0:
-                        has_trans = True
-                        Etrans = float(Ea[post[rising[0]]])
-                break
-
-    # Cathodic diffusion flat-run
-    cat = E < Ecorr - 0.005
-    has_diff = False
-    if np.sum(cat) > 8:
-        Ec, adyc, dyc = E[cat], adY[cat], dY[cat]
-        thr_c = max(np.percentile(adyc, 30), 0.5)
-        flatc = adyc < thr_c
-        runs_c = [(k, list(g)) for k, g in groupby(enumerate(flatc), key=lambda x: x[1]) if k]
-        if runs_c:
-            idxs = [s[0] for s in max(runs_c, key=lambda x: len(x[1]))[1]]
-            if len(idxs) >= 3 and abs(Ec[idxs[-1]] - Ec[idxs[0]]) > 0.03:
-                has_diff = True
-
-    return dict(
-        has_passive=has_passive, Epass=Epass, ip=ip,
-        has_trans=has_trans, Etrans=Etrans,
-        has_diff=has_diff
-    )
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STAGE 3 — ANODIC BRANCH FIT (REFINED)
+# ANODIC BRANCH FIT (PolCurveFit-inspired)
 # ─────────────────────────────────────────────────────────────────────────────
 def fit_anodic(E, i, Ecorr):
-    """
-    PolCurveFit-inspired active-region detector:
-      - Detect E_peak (derivative sign change + optional peak finder).
-      - Bound active zone by E_peak or a sustained derivative drop (or E_pass).
-      - Sliding windows scored by: (R²²) × (length bonus) × (slope stability) × (steepness).
-      - HARD gate on βa range. Theil–Sen + Huber refinement on best window.
-    """
     ano = i > 0
     if np.sum(ano) < 4:
         return dict(ba=0.060, has_passive=False, Epass=None, ip=1e-6,
@@ -451,18 +517,18 @@ def fit_anodic(E, i, Ecorr):
     Ea  = E[ano]; lgia = slog(i[ano])
     si  = np.argsort(Ea); Ea, lgia = Ea[si], lgia[si]
 
-    # Passive / Transpassive detection (objective)
+    # Derivative-based region hints
     reg = _derivative_based_regions(E, i, Ecorr)
     has_passive = bool(reg["has_passive"]); Epass = reg["Epass"]; ip = (reg["ip"] if reg["ip"] is not None else 1e-6)
     has_trans   = bool(reg["has_trans"]);   Etrans = reg["Etrans"]
 
-    # Smooth (cap window to avoid over-smoothing a narrow active peak)
+    # Smooth for peak and slope analysis
     w_pk = max(5, min(9, len(Ea) // 2 * 2 - 1))
     lgia_sm = savgol_filter(lgia, w_pk, 3, mode="interp")
     dY = np.gradient(lgia_sm, Ea)
 
     # E_peak by derivative sign change (+→-) near Ecorr
-    sign_chg = np.where(np.diff(np.sign(dY)) < 0)[0]   # rising→falling
+    sign_chg = np.where(np.diff(np.sign(dY)) < 0)[0]
     cands = [Ea[k] for k in sign_chg if Ea[k] > Ecorr + 0.005 and Ea[k] < Ea[-1] - 0.05]
     Epeak_detected = None
     if cands:
@@ -482,7 +548,6 @@ def fit_anodic(E, i, Ecorr):
     elif has_passive and Epass is not None:
         E_upper = Epass
     else:
-        # Fallback: sustained derivative drop (< 40% of local max) within 300 mV
         _near_mask = (Ea > Ecorr + CFG["anod_guard"]) & (Ea < Ecorr + 0.30)
         if np.sum(_near_mask) >= 4:
             max_slope = float(np.max(np.abs(dY[_near_mask])))
@@ -493,7 +558,6 @@ def fit_anodic(E, i, Ecorr):
                 if (cands2[k+1] == idx + 1) and Ea[idx] > Ecorr + 0.020:
                     E_upper = float(Ea[idx]); break
 
-    # Base mask: strictly anodic side
     base_mask = Ea > (Ecorr + CFG["anod_guard"])
     if E_upper is not None:
         base_mask = base_mask & (Ea <= E_upper)
@@ -506,8 +570,7 @@ def fit_anodic(E, i, Ecorr):
                     has_trans=has_trans, Etrans=Etrans, Epeak=Epeak_detected,
                     r2=0.0, E_an=Ea, lgi_an=lgia)
 
-    # Recompute smooth/derivatives on the working set
-    w_sm = max(5, min(11, len(Ex)//2*2 - 1))
+    w_sm = max(5, min(11, len(Ex)//2*2-1))
     Y_sm = savgol_filter(Yx, w_sm, 3, mode="interp")
     dY_w = np.gradient(Y_sm, Ex)
 
@@ -521,7 +584,6 @@ def fit_anodic(E, i, Ecorr):
         if len(Ex) < CFG["min_w_ano"]:
             Ex, Yx = Ea[base_mask], lgia[base_mask]
 
-    # Sliding window — PolCurveFit-inspired scoring
     s_idx, e_idx, slope, intercept, R2 = _sliding_regress_full(
         Ex, Yx, min_len=CFG["min_w_ano"], max_len=20)
     if len(slope) == 0:
@@ -534,15 +596,14 @@ def fit_anodic(E, i, Ecorr):
     win_len = (e_idx - s_idx).astype(float)
     len_bonus = np.log1p(win_len) / np.log1p(25.0)
 
-    # Slope stability (constant dY across the window)
+    # Slope stability inside candidate window
     def _stability(s, e):
         dseg = np.gradient(sm(Yx[s:e], max(5, min(9, (e-s)//2*2-1))), Ex[s:e])
         m = np.mean(dseg) if len(dseg) else 0.0
         sd = np.std(dseg) if len(dseg) else 1.0
-        return float(1.0 / (1.0 + (sd / (abs(m)+1e-9))))  # ∈ (0,1]
+        return float(1.0 / (1.0 + (sd / (abs(m)+1e-9))))
     stab = np.array([_stability(s, e) for s, e in zip(s_idx, e_idx)])
 
-    # Steepness (normalize by the steepest β-ok slope)
     abs_slope = np.abs(slope)
     ref = float(np.max(abs_slope[beta_ok])) if np.any(beta_ok) else np.max(abs_slope)
     steep = abs_slope / max(ref, 1e-9)
@@ -585,10 +646,9 @@ def fit_anodic(E, i, Ecorr):
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STAGE 4 — CLASSIFY CURVE TYPE (objective + local fit results)
+# CLASSIFICATION — ALWAYS FULLY AUTO
 # ─────────────────────────────────────────────────────────────────────────────
 def classify_curve(cat_res, an_res, E, i, Ecorr):
-    # Start with objective region checks
     reg = _derivative_based_regions(E, i, Ecorr)
     hp = reg["has_passive"] or an_res.get("has_passive", False)
     ht = reg["has_trans"]   or an_res.get("has_trans", False)
@@ -599,7 +659,7 @@ def classify_curve(cat_res, an_res, E, i, Ecorr):
     return CT.A
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TAFEL INTERSECTION (local lines)
+# TAFEL INTERSECTION
 # ─────────────────────────────────────────────────────────────────────────────
 def tafel_intersection(cat_res, an_res):
     if ("slope_c" in cat_res and "intercept_c" in cat_res and
@@ -614,7 +674,7 @@ def tafel_intersection(cat_res, an_res):
     return None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STAGE 5 — P0, BOUNDS, WEIGHTS
+# INITIAL GUESS, BOUNDS, WEIGHTS
 # ─────────────────────────────────────────────────────────────────────────────
 def _make_p0(Ecorr, cat, an, ct, E_max):
     ic, bc, ba, iL = cat["icorr"], cat["bc"], an["ba"], cat["iL"]
@@ -626,7 +686,6 @@ def _make_p0(Ecorr, cat, an, ct, E_max):
 
 def _build_bounds(Ecorr, cat, an, ct, E_min, E_max, E_span):
     ic      = max(cat["icorr"], 1e-14)
-    iL_est  = max(cat["iL"],    1e-10)
     ba_fit  = float(an["ba"])
     bc_fit  = float(cat["bc"])
 
@@ -671,10 +730,6 @@ def _unpack(x, fidx, p_base, lo=None, hi=None):
         p[j] = val
     return p
 
-def _pbounds(lo, hi, fidx):
-    return [(np.log10(max(lo[j], TINY)), np.log10(max(hi[j], TINY)))
-            if j in LOG_IDX else (lo[j], hi[j]) for j in fidx]
-
 def _ls_bounds(lo, hi, fidx):
     low = np.array([np.log10(max(lo[j], TINY)) if j in LOG_IDX else lo[j] for j in fidx])
     up  = np.array([np.log10(max(hi[j], TINY)) if j in LOG_IDX else hi[j] for j in fidx])
@@ -703,13 +758,9 @@ def _section_weights(E, i, Ecorr_est, Epass_est=None):
     return w
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GLOBAL FIT (robust bounded least-squares; PolCurveFit-inspired)
+# GLOBAL FIT — ROBUST BOUNDED LEAST-SQUARES (soft-L1)
 # ─────────────────────────────────────────────────────────────────────────────
 def global_polish(E, i, p0, ct, lo, hi):
-    """
-    Robust bounded least-squares on log-domain residuals with section-balanced weights.
-    Uses soft-L1 loss for outlier robustness. Parameter transforms preserved.
-    """
     ld   = slog(i)
     fidx = CT.idx(ct)
     bounds_ls = _ls_bounds(lo, hi, fidx)
@@ -725,7 +776,6 @@ def global_polish(E, i, p0, ct, lo, hi):
             r = (ld - slog(pred))
             return np.sqrt(w_base) * r
         except Exception:
-            # Large residual to push solver away
             return np.sqrt(w_base) * (ld - (ld - 50.0))
 
     x0 = _pack(p0, fidx)
@@ -740,13 +790,13 @@ def global_polish(E, i, p0, ct, lo, hi):
 
     best_p = _unpack(res.x, fidx, p0.copy(), lo, hi)
     log_p  = slog(pol_model(E, best_p, ct))
-    sse    = float(np.sum((ld - log_p) ** 2))  # unweighted SSE for AIC/R² reporting
+    sse    = float(np.sum((ld - log_p) ** 2))
     r2     = r2_score(ld, log_p)
     aic    = aicc(len(E), len(fidx), sse)
     return best_p, r2, aic, sse
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PUBLICATION FIGURE (as in v2)
+# FIGURE (unchanged structure)
 # ─────────────────────────────────────────────────────────────────────────────
 PLT_RC = {
     "font.family": "DejaVu Sans", "font.size": 10,
@@ -766,8 +816,6 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
                 Ecorr, taf=None, extend_tafel=True, use_tafel_icorr=True,
                 show_regions=True, dpi=150):
     Ecorr_fit = float(best_p[0])
-    ba    = max(float(best_p[2]), 1e-9)
-    bc    = max(float(best_p[3]), 1e-9)
     icorr_model = float(best_p[1])
 
     E_lo, E_hi = float(E.min()), float(E.max())
@@ -885,8 +933,7 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
             wa1 = float(an_res["win_a"][1])
             if active_upper is not None:
                 wa1 = min(wa1, active_upper)
-            if wa1 <= wa0:
-                wa1 = wa0 + 0.010
+            if wa1 <= wa0: wa1 = wa0 + 0.010
             ba_lbl = f"βa = {min(abs(1/sa), CFG['beta_max_a'])*1000:.0f} mV/dec"
             ext_l = ecorr_display if extend_tafel else None
             _tafel_line(ax, sa, ia_int, wa0, wa1, "#e67e22",
@@ -920,11 +967,6 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
         ax.grid(True, which="major", ls="--", alpha=0.45)
         ax.grid(True, which="minor", ls=":", alpha=0.18)
         ax.legend(loc="lower right", ncol=5, fontsize=7.5, framealpha=0.95, edgecolor="#cccccc")
-        r2c = "#27ae60" if r2v > 0.99 else "#e67e22" if r2v > 0.95 else "#e84393"
-        ax.text(0.01, 0.97,
-                f"R²={r2v:.5f}  RMSE={rmse:.4f}  Model: {CT.name(ct)}",
-                transform=ax.transAxes, fontsize=8.5, color=r2c, fontweight="bold", va="top",
-                bbox=dict(fc="white", ec=r2c, alpha=0.88, pad=3, boxstyle="round,pad=0.3"))
 
         # Cathodic zoom
         ax = ax_cat
@@ -945,7 +987,7 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
                 E_win = np.linspace(wc0, wc1, 100)
                 ax.plot(E_win, sc*E_win + ic_int, "-", color="#8e44ad", lw=2.2, zorder=5,
                         label=f"βc = {min(abs(1/sc), CFG['beta_max_c'])*1000:.0f} mV/dec")
-                if extend_tafel and wc1 < ecorr_display:
+                if wc1 < ecorr_display:
                     E_ext = np.linspace(wc1, ecorr_display, 80)
                     ax.plot(E_ext, sc*E_ext + ic_int, "--", color="#8e44ad",
                             lw=1.4, alpha=0.50, zorder=4)
@@ -991,7 +1033,7 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
                     E_win_a = np.linspace(wa0, wa1, 100)
                     ax.plot(E_win_a, sa*E_win_a + ia_int, "-", color="#e67e22", lw=2.2, zorder=5,
                             label=f"βa = {min(abs(1/sa), CFG['beta_max_a'])*1000:.0f} mV/dec")
-                    if extend_tafel and ecorr_display < wa0:
+                    if ecorr_display < wa0:
                         E_ext_a = np.linspace(ecorr_display, wa0, 80)
                         ax.plot(E_ext_a, sa*E_ext_a + ia_int, "--", color="#e67e22",
                                 lw=1.4, alpha=0.50, zorder=4)
@@ -1012,7 +1054,7 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
         ax.grid(True, which="major", ls="--", alpha=0.4)
         ax.legend(fontsize=7.5)
 
-        # Passive + Transpassive
+        # Passive + Transpassive or Stern plot
         ax = ax_pass
         if ct in CT.PASS:
             Ep_fit = float(best_p[4])
@@ -1087,7 +1129,7 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
     return fig, r2v, rmse, icorr_display, ecorr_display
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EXPORT (unchanged)
+# EXPORT
 # ─────────────────────────────────────────────────────────────────────────────
 def export_excel(results_list):
     wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Results"
@@ -1221,7 +1263,7 @@ for _k in ("results", "figures"):
         st.session_state[_k] = []
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIDEBAR
+# SIDEBAR (Auto by default; manual overrides optional)
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## ⚙️ Configuration")
@@ -1232,37 +1274,33 @@ with st.sidebar:
     ew_mat, rho_mat = MATERIALS[material]
 
     st.markdown("**Data Import**")
-    skip_rows  = st.number_input("Skip header rows", 0, 30, 0)
-    delimiter  = st.selectbox("CSV delimiter", ["auto",",",";","\t"," "])
-    e_col_name = st.text_input("E column (blank = auto)", "")
-    i_col_name = st.text_input("i column (blank = auto)", "")
     i_unit     = st.selectbox("Current unit in file",
                               ["A/cm²","mA/cm²","µA/cm²","A/m²"])
     unit_fac   = {"A/cm²":1.0,"mA/cm²":1e-3,"µA/cm²":1e-6,"A/m²":1e-4}[i_unit]
     area       = st.number_input("Electrode area (cm²)", 0.001, 10000.0, 1.0, format="%.4f")
 
-    st.markdown("**Plotting**")
+    st.markdown("**Detection mode**")
+    AUTO_TUNE = st.toggle("Auto‑tune detection (recommended for non‑experts)", True)
     extend_tafel = st.toggle("Extend Tafel dashed lines to Ecorr", True)
     use_tafel_icorr = st.toggle("Use Tafel intersection for i_corr", True)
     show_regs  = st.toggle("Shade regions", True)
     smooth_pre = st.toggle("Pre-smooth (Savitzky-Golay)", False)
     pub_dpi    = st.slider("Export DPI", 150, 600, 300, 50)
 
-    with st.expander("Advanced (Tafel window detection)"):
-        CFG["anod_guard"]   = st.number_input("Anodic guard from Ecorr (V)", 0.0, 0.100, CFG["anod_guard"], 0.001, format="%.3f")
-        CFG["cath_guard"]   = st.number_input("Cathodic guard from Ecorr (V)", 0.0, 0.150, CFG["cath_guard"], 0.001, format="%.3f")
-        CFG["curvature_max"]= st.number_input("Curvature max |d²log|i|/dE²|", 10.0, 200.0, CFG["curvature_max"], 1.0)
-        CFG["lin_frac"]     = st.slider("Linearity fraction (derivative consistency)", 0.4, 0.95, CFG["lin_frac"], 0.05)
-        CFG["min_w_ano"]    = st.number_input("Min window points (anodic)", 3, 20, CFG["min_w_ano"])
-        CFG["min_w_cat"]    = st.number_input("Min window points (cathodic)", 4, 25, CFG["min_w_cat"])
-        CFG["beta_min"]     = st.number_input("β min (V/dec)", 0.005, 0.100, CFG["beta_min"], 0.005, format="%.3f")
-        CFG["beta_max_a"]   = st.number_input("βa max (V/dec)", 0.05, 0.40, CFG["beta_max_a"], 0.005)
-        CFG["beta_max_c"]   = st.number_input("βc max (V/dec)", 0.05, 0.40, CFG["beta_max_c"], 0.005)
+    with st.expander("Advanced (Tafel window detection) — overrides (optional)"):
+        st.caption("These fields are ignored when Auto‑tune is enabled.")
+        CFG["anod_guard"]   = st.number_input("Anodic guard from Ecorr (V)", 0.0, 0.100, CFG_DEFAULT["anod_guard"], 0.001, format="%.3f")
+        CFG["cath_guard"]   = st.number_input("Cathodic guard from Ecorr (V)", 0.0, 0.150, CFG_DEFAULT["cath_guard"], 0.001, format="%.3f")
+        CFG["curvature_max"]= st.number_input("Curvature max |d²log|i|/dE²|", 10.0, 200.0, CFG_DEFAULT["curvature_max"], 1.0)
+        CFG["lin_frac"]     = st.slider("Linearity fraction (derivative consistency)", 0.4, 0.95, CFG_DEFAULT["lin_frac"], 0.05)
+        CFG["min_w_ano"]    = st.number_input("Min window points (anodic)", 3, 20, CFG_DEFAULT["min_w_ano"])
+        CFG["min_w_cat"]    = st.number_input("Min window points (cathodic)", 4, 25, CFG_DEFAULT["min_w_cat"])
+        CFG["beta_min"]     = st.number_input("β min (V/dec)", 0.005, 0.100, CFG_DEFAULT["beta_min"], 0.005, format="%.3f")
+        CFG["beta_max_a"]   = st.number_input("βa max (V/dec)", 0.05, 0.40, CFG_DEFAULT["beta_max_a"], 0.005)
+        CFG["beta_max_c"]   = st.number_input("βc max (V/dec)", 0.05, 0.40, CFG_DEFAULT["beta_max_c"], 0.005)
 
-    st.markdown("**Fitting**")
-    force_ct_val = st.selectbox("Force model (auto = best AICc)",
-                                ["auto","A","AD","P","PT","F"],
-                                key="force_ct_choice")
+    st.markdown("**Global fitting**")
+    force_ct_val = st.selectbox("Force model (optional)", ["Auto (try all)","A","AD","P","PT","F"])
 
     st.divider()
     if st.button("🗑 Clear all", use_container_width=True):
@@ -1331,11 +1369,14 @@ with tab_fit:
         for idx, uf in enumerate(uploaded_files):
             st.markdown(f"---\n#### 📄 `{uf.name}`")
             with st.container():
+
+                # Load
                 try:
                     df_raw = load_file(uf)
                 except Exception as ex:
                     st.error(f"Load error: {ex}"); continue
 
+                # Column selection
                 try:
                     ec_auto, ic_auto, _ = _auto_cols(df_raw)
                     auto_ok = True
@@ -1354,6 +1395,7 @@ with tab_fit:
                         index=num_cols.index(ic_auto) if auto_ok and ic_auto in num_cols else min(1,len(num_cols)-1),
                         key=f"ic_{idx}")
 
+                # Build arrays
                 E_raw = df_raw[e_sel].values.astype(float)
                 i_raw = df_raw[i_sel].values.astype(float)
                 i_obs = i_raw * unit_fac / area
@@ -1361,10 +1403,12 @@ with tab_fit:
                 E_raw, i_obs = E_raw[ok_mask], i_obs[ok_mask]
                 srt = np.argsort(E_raw); E, i = E_raw[srt], i_obs[srt]
 
+                # Preview
                 p1, p2 = st.columns([1, 1.6])
                 sc = np.where(np.diff(np.sign(i)))[0]
                 with p1:
-                    st.markdown(f"**{len(E)} pts** | E: [{E.min():.4f}, {E.max():.4f}] V")
+                    st.markdown(f"**{len(E)} pts** | "
+                                f"E: [{E.min():.4f}, {E.max():.4f}] V")
                     if len(sc) > 0:
                         Ec_pre = E[sc[0]] - i[sc[0]]*(E[sc[0]+1]-E[sc[0]])/(i[sc[0]+1]-i[sc[0]])
                         st.success(f"✓ Zero-crossing at E ≈ {Ec_pre:.4f} V  "
@@ -1388,10 +1432,14 @@ with tab_fit:
                     st.pyplot(fp, use_container_width=True)
                     plt.close(fp)
 
+                # ── FIT BUTTON ──────────────────────────────────────────────
                 if st.button(f"🚀 Run Full Pipeline · {uf.name}",
                              key=f"btn_{idx}", type="primary",
                              use_container_width=True):
                     import time; t0 = time.time()
+
+                    # Reset CFG to defaults each run, then apply Auto/Manual
+                    CFG.clear(); CFG.update(CFG_DEFAULT)
 
                     if smooth_pre:
                         w = min(9, len(i)//2*2-1)
@@ -1405,19 +1453,33 @@ with tab_fit:
                         log_lines.append(msg)
                         log_area.markdown("  \n".join(log_lines))
 
+                    # Stage 1 — E_corr
                     Ecorr, _ = detect_ecorr(E, i)
                     log(f"✅ **Stage 1** — E_corr = `{Ecorr:.5f}` V")
-                    prog.progress(15, text="Stage 2 — Cathodic branch fit…")
 
+                    # Optional automatic hyperparameter tuning
+                    if AUTO_TUNE:
+                        tuned, notes = auto_tune_cfg(E, i)
+                        CFG.update(tuned)
+                        log("⚙️ **Auto‑tune applied**:")
+                        for s in notes:
+                            log(f"   · {s}")
+                    else:
+                        log("⚙️ Manual detection settings in use (Advanced overrides).")
+
+                    prog.progress(20, text="Stage 2 — Cathodic branch fit…")
+
+                    # Stage 2 — Cathodic
                     cat_res = fit_cathodic(E, i, Ecorr)
                     win_c_str = f"  win=[`{cat_res['win_c'][0]:.4f}`, `{cat_res['win_c'][1]:.4f}`]V" if 'win_c' in cat_res else ""
                     log(f"✅ **Stage 2** — βc(local) = `{cat_res['bc']*1000:.0f}` mV/dec  "
                         f"i_corr ≈ `{cat_res['icorr']:.2e}`  "
                         f"R²_cat = `{cat_res['r2']:.4f}`  "
-                        f"diff_limit = `{'yes' if cat_res['has_diff'] else 'no'}`"
-                        f"{win_c_str}")
-                    prog.progress(30, text="Stage 3 — Anodic branch fit…")
+                        f"diff_limit = `{'yes' if cat_res['has_diff'] else 'no'}`{win_c_str}")
 
+                    prog.progress(40, text="Stage 3 — Anodic branch fit…")
+
+                    # Stage 3 — Anodic
                     an_res = fit_anodic(E, i, Ecorr)
                     epeak_str = f"  Epeak=`{an_res['Epeak']:.4f}V`" if an_res.get('Epeak') else ""
                     epass_str = f"  E_pass=`{an_res['Epass']:.4f}V`  ip=`{an_res['ip']:.2e}`" if an_res['has_passive'] else ""
@@ -1427,67 +1489,47 @@ with tab_fit:
                         f"  passive = `{'yes' if an_res['has_passive'] else 'no'}`{epass_str}"
                         f"  transpassive = `{'yes' if an_res['has_trans'] else 'no'}`{etrans_str}"
                         f"  R²_ano = `{an_res['r2']:.4f}`")
-                    prog.progress(45, text="Stage 4 — Classifying curve type…")
 
-                    ct_detected = classify_curve(cat_res, an_res, E, i, Ecorr)
-                    log(f"🔍 **Stage 4** — Detected: **{CT.name(ct_detected)}**  "
-                        f"({CT.nfree(ct_detected)} free parameters)")
-                    prog.progress(50, text="Stage 5 — Global optimisation…")
+                    prog.progress(55, text="Stage 4 — Classifying curve type…")
 
-                    E_lo = float(E.min()); E_hi = float(E.max()); E_sp = E_hi - E_lo
+                    # Stage 4 — Classification hint (not final selection)
+                    ct_hint = classify_curve(cat_res, an_res, E, i, Ecorr)
+                    log(f"🔍 **Stage 4** — Region-based hint: **{CT.name(ct_hint)}**")
 
-                    force_choice = st.session_state.get("force_ct_choice", "auto")
-                    if force_choice == "auto":
-                        candidates = []
-                        reg = _derivative_based_regions(E, i, Ecorr)
-                        if reg["has_passive"] and reg["has_diff"]:
-                            candidates = [CT.F, CT.PT, CT.P, CT.AD, CT.A]
-                        elif reg["has_passive"]:
-                            candidates = [CT.PT, CT.P, CT.F, CT.A]
-                        elif reg["has_diff"]:
-                            candidates = [CT.AD, CT.A, CT.P]
-                        else:
-                            candidates = [ct_detected, CT.P, CT.AD]
-                        seen = set(); uniq = []
-                        for c in candidates:
-                            if c not in seen:
-                                uniq.append(c); seen.add(c)
-                        candidates = uniq
-                    else:
-                        candidates = [force_choice]
+                    prog.progress(60, text="Stage 5 — Global optimisation (all models)…")
 
+                    # Stage 5 — Try all models unless forced
+                    candidates = CT.ALL if force_ct_val.startswith("Auto") else [force_ct_val]
                     all_res = []
-                    n_cand  = len(candidates)
                     for k_c, ct_try in enumerate(candidates):
-                        prog.progress(50 + int(40 * k_c / max(n_cand,1)),
+                        prog.progress(60 + int(35 * (k_c+1) / len(candidates)),
                                       text=f"Optimising: {CT.name(ct_try)}…")
+                        E_lo = float(E.min()); E_hi = float(E.max()); E_sp = E_hi - E_lo
                         p0 = _make_p0(Ecorr, cat_res, an_res, ct_try, E_hi)
-                        lo, hi = _build_bounds(Ecorr, cat_res, an_res,
-                                               ct_try, E_lo, E_hi, E_sp)
+                        lo, hi = _build_bounds(Ecorr, cat_res, an_res, ct_try, E_lo, E_hi, E_sp)
                         p0 = np.clip(p0, lo, hi)
                         bp, r2v, aic_v, sse = global_polish(E, i, p0, ct_try, lo, hi)
-                        all_res.append(dict(ct=ct_try, r2=r2v, aicc=aic_v,
-                                            params=bp, success=r2v > 0.90))
+                        all_res.append(dict(ct=ct_try, r2=r2v, aicc=aic_v, params=bp, success=r2v > 0.90))
                         log(f"  · {CT.name(ct_try):35s} R² = `{r2v:.6f}`  AICc = `{aic_v:.1f}`")
 
                     all_res.sort(key=lambda x: x["aicc"])
                     best_r = all_res[0]
+                    # Prefer simpler model if ΔR² < 0.005
                     for r in all_res:
-                        if (CT.nfree(r["ct"]) < CT.nfree(best_r["ct"])
-                                and best_r["r2"] - r["r2"] < 0.005):
+                        if (CT.nfree(r["ct"]) < CT.nfree(best_r["ct"]) and best_r["r2"] - r["r2"] < 0.005):
                             best_r = r; break
 
                     best_p  = best_r["params"]
                     best_ct = best_r["ct"]
                     r2_fin  = best_r["r2"]
 
-                    log(f"🏆 **Stage 5 complete** — Best model: **{CT.name(best_ct)}**  "
-                        f"R² = `{r2_fin:.6f}`  "
+                    log(f"🏆 **Selected model**: **{CT.name(best_ct)}**  R² = `{r2_fin:.6f}`  "
                         f"(elapsed `{time.time()-t0:.1f}` s)")
                     prog.progress(95, text="Building figure…")
 
                     taf = tafel_intersection(cat_res, an_res)
 
+                    # Figure and exports
                     try:
                         fig, r2_fig, rmse_fig, icorr_disp, ecorr_disp = make_figure(
                             E, i, best_p, best_ct, sample_name or uf.name,
@@ -1526,6 +1568,7 @@ with tab_fit:
                         st.error(f"Figure error: {ex}")
                         st.code(traceback.format_exc())
 
+                    # Summary metrics
                     p = best_p
                     B_val = (p[2]*p[3])/(2.303*(p[2]+p[3])) if p[2]>0 and p[3]>0 else 0
                     CR    = icorr_disp * 3.27 * ew_mat / rho_mat
@@ -1533,13 +1576,7 @@ with tab_fit:
                     ba_valid = float(p[2]) < 0.240
                     bc_valid = float(p[3]) < 0.270
                     if not ba_valid or not bc_valid:
-                        st.warning(
-                            f"⚠️ {'βa' if not ba_valid else ''}"
-                            f"{' and ' if not ba_valid and not bc_valid else ''}"
-                            f"{'βc' if not bc_valid else ''} hit the upper bound — "
-                            "no reliable linear Tafel region was found for that branch. "
-                            "The corrosion current is estimated primarily from the other branch. "
-                            "Consider adjusting the guard or window in Advanced settings.")
+                        st.warning("One of the Tafel slopes reached the upper cap; i_corr is still taken from the Tafel intersection/global model, but review recommended.")
 
                     st.markdown("#### 📐 Fitted Parameters")
                     mc = st.columns(5)
@@ -1590,18 +1627,6 @@ with tab_fit:
                                 + (f"- E_trans = `{p[7]:.4f}` V" if best_ct in CT.TRANS else "- Transpassive: not detected"))
                         else:
                             st.markdown("**No passive region detected**")
-
-                    if len(all_res) > 1:
-                        st.markdown("**🏆 Model Comparison (AICc)**")
-                        cmp_rows = [{
-                            "Model": CT.name(r["ct"]),
-                            "Free params": CT.nfree(r["ct"]),
-                            "R²": f"{r['r2']:.6f}",
-                            "AICc": f"{r['aicc']:.1f}",
-                            "Selected": "✅" if r["ct"]==best_ct else ""
-                        } for r in sorted(all_res, key=lambda x: x["aicc"])]
-                        st.dataframe(pd.DataFrame(cmp_rows),
-                                     use_container_width=True, hide_index=True)
 
                     d1, d2 = st.columns(2)
                     d1.download_button("⬇ PNG", png_bytes,
@@ -1705,13 +1730,15 @@ with tab_cmp:
 
 with tab_help:
     st.markdown("""
-### What’s new in this build
-- Anodic active Tafel window is selected from a constant‑slope region (stable derivative) and bounded by E_peak/E_pass (or a sustained derivative drop if neither is present).
-- Region classification (A, AD, P, PT, F) is driven by objective flat‑run tests on d(log|i|)/dE, then cross‑checked with local fits.
-- Global fitting uses robust bounded least‑squares (soft‑L1) on log‑residuals with section‑balanced weights; this mirrors PolCurveFit’s robust LS philosophy.
+### Automatic mode (recommended)
+- The app auto‑tunes Tafel detection settings from the uploaded data, then tries all curve models (A, AD, P, PT, F) and selects the best by AICc with a small parsimony preference.
+- Default limits enforce physically plausible Tafel slopes (βa ≤ 250 mV/dec, βc ≤ 280 mV/dec).
 
-### Tips
-- If the anodic Tafel looks short: decrease “Anodic guard” to 0.005–0.008 V.
-- If cathodic diffusion is mis‑detected: increase “Curvature max” and verify sign convention (cathodic < 0).
-- For very noisy curves, enable “Pre‑smooth”.
+### Manual overrides
+- Expand “Advanced (Tafel window detection)” in the sidebar to override the auto‑tuned values. When Auto‑tune is on, those fields are ignored.
+
+### Tips for robust use
+- Keep the current sign convention (cathodic < 0, anodic > 0).
+- If data are very noisy, enable “Pre‑smooth”.
+- Use the exported Excel/PDF to archive results and diagnostic figures.
 """)
