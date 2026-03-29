@@ -1302,8 +1302,7 @@ def load_file(uploaded):
     for sep in ["\t", ";", ",", r"\s+"]:
         try:
             df = pd.read_csv(io.StringIO(content), sep=sep, engine="python", comment="#")
-            if df.shape[1] >= 2 and df.shape[0] > 4: return df.dropna(axis=1, h
-ow="all")
+            if df.shape[1] >= 2 and df.shape[0] > 4: return df.dropna(axis=1, how="all")
         except: continue
     raise ValueError("Cannot parse file.")
 
