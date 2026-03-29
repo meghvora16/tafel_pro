@@ -299,9 +299,14 @@ def fit_cathodic(E, i, Ecorr):
     # ── Remove diffusion plateau top (flat region at most negative cathodic E) ──
     # Trim the top 0.8 decades (plateau) so the Tafel region dominates
     lgi_max = float(np.max(lgi))
-    trim_mask = lgi < lgi_max - 0.8
+    # 1.5 dec trim: removes plateau AND transition zone.
+    # 0.8 was insufficient — plateau-to-Tafel transition had near-zero
+    # d2Y and competed with the Tafel region → gave bc=233 on real SS data.
+    trim_mask = lgi < lgi_max - 1.5
     if np.sum(trim_mask) < CFG["min_w_cat"] + 2:
-        trim_mask = lgi < lgi_max - 0.3  # relax if too few pts
+        trim_mask = lgi < lgi_max - 0.8
+    if np.sum(trim_mask) < CFG["min_w_cat"] + 2:
+        trim_mask = lgi < lgi_max - 0.3
     if np.sum(trim_mask) < CFG["min_w_cat"]:
         trim_mask = np.ones(len(lgi), bool)
 
@@ -507,8 +512,12 @@ def fit_anodic(E, i, Ecorr):
         lgia_sm = savgol_filter(lgia, max(5, min(11, len(Ea)//2*2-1)), 3, mode="interp")
         dlg = np.gradient(lgia_sm, Ea); adlg = np.abs(dlg)
         p10 = np.percentile(adlg, 10)
-        thr = max(p10 * 4.0, min(2.0, np.percentile(adlg, 25)))
-        flat = adlg < thr
+        p25 = np.percentile(adlg, 25)
+        # Dual threshold — more robust to high noise:
+        thr_rel = p10 * 4.0          # relative: 4× the quietest 10%
+        thr_abs = 1.5                # absolute: passive plateaus < 1.5 dec/V
+        thr = max(thr_rel, min(thr_abs, p25))
+        flat = (adlg < thr) | (adlg < thr_abs)  # OR union catches noisy data
         runs = [(k, list(g)) for k, g in groupby(enumerate(flat), key=lambda x: x[1]) if k]
         for _, ri in runs:
             idxs = [s[0] for s in ri]
@@ -698,11 +707,11 @@ def _build_bounds(Ecorr, cat, an, ct, E_min, E_max, E_span):
     Ep_hi   = min(E_max,         Ep_init + 0.06)
 
     # iL
-    i_max = max(float(np.max(np.abs(cat.get("lgi_cat", [ic * 100])))), ic * 10)
+    i_max = max(float(cat.get("iL", ic * 1e4)), ic * 10)  # use iL, not log array
     iL_lo = max(ic * 3.0,   1e-13)
     iL_hi = min(iL_est * 20, 1.0)
 
-    lo = np.array([max(E_min, Ecorr - 0.04),   # Ecorr
+    lo = np.array([max(E_min, Ecorr - 0.08),   # Ecorr ±80mV
                    max(ic * 1e-3, 1e-15),        # icorr
                    ba_lo, bc_lo,
                    Ep_lo, 0.001,                  # Epass, k_pass
