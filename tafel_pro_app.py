@@ -1054,8 +1054,17 @@ PLT_RC = {
 def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
                 Ecorr, taf=None, extend_tafel=True, use_tafel_icorr=True,
                 show_regions=True, dpi=150):
-    Ecorr_fit = float(best_p[0])
+    """
+    Publication-grade figure with 2-row layout:
+      Row 1: Full Evans Diagram (spanning all columns)
+      Row 2: Cathodic Tafel zoom | Anodic/Active zoom | Passive+Trans zoom | Residuals
 
+    Tafel lines are drawn ONLY within their fitted linear windows (solid thick),
+    then extended as thin dashed lines toward the Ecorr intersection.
+    No model-partial fallback lines — if local fit is absent, nothing is drawn.
+    The Ecorr and icorr are always shown as the Tafel-line intersection point.
+    """
+    Ecorr_fit = float(best_p[0])
     ba    = max(float(best_p[2]), 1e-9)
     bc    = max(float(best_p[3]), 1e-9)
     icorr_model = float(best_p[1])
@@ -1065,12 +1074,12 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
     n_dense = int(np.clip(200 * span, 800, 2500))
     E_dense = np.linspace(E_lo, E_hi, n_dense)
 
-    i_dense    = pol_model(E_dense, best_p, ct)
-    i_fit_E    = pol_model(E, best_p, ct)
-    log_obs    = slog(i_obs)
-    log_den    = slog(i_dense)
-    log_fitE   = slog(i_fit_E)
-    residuals  = log_obs - log_fitE
+    i_dense  = pol_model(E_dense, best_p, ct)
+    i_fit_E  = pol_model(E, best_p, ct)
+    log_obs  = slog(i_obs)
+    log_den  = slog(i_dense)
+    log_fitE = slog(i_fit_E)
+    residuals = log_obs - log_fitE
     r2v  = r2_score(log_obs, log_fitE)
     rmse = float(np.sqrt(np.mean(residuals**2)))
 
@@ -1080,291 +1089,343 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
     if ct in CT.PASS:
         Epass_4y = float(best_p[4])
         act_mask = (E >= Ecorr_fit - 0.02) & (E <= Epass_4y + 0.05)
-        if np.sum(act_mask) >= 2:
-            log_act = slog(i_obs[act_mask])
-            log_act = log_act[np.isfinite(log_act)]
-            active_peak_log = float(np.max(log_act)) if len(log_act) > 0 else np.log10(max(icorr_model,TINY))
-        else:
-            active_peak_log = np.log10(max(icorr_model,TINY)) + 2.303 * (Epass_4y - Ecorr_fit) / ba
+        log_act = slog(i_obs[act_mask])
+        log_act = log_act[np.isfinite(log_act)]
+        active_peak_log = float(np.max(log_act)) if len(log_act) > 0 else np.log10(max(icorr_model, TINY))
         logIp_val = float(np.log10(max(float(best_p[6]), TINY)))
         y_hi = max(active_peak_log + 1.5, logIp_val + 2.0)
     else:
         y_hi = float(np.percentile(fin, 90)) + 1.0
-
     y_hi = min(y_hi, float(np.percentile(fin, 99)) + 1.8)
 
-    # Model partials (fallback Tafel lines from model parameters)
-    logI_cat_model = np.log10(np.clip(icorr_model * np.exp(2.303*(Ecorr_fit-E_dense)/bc), TINY, None))
-    logI_ano_model = np.log10(np.clip(icorr_model * np.exp(2.303*(E_dense-Ecorr_fit)/ba), TINY, None))
-
-    # Decide display i_corr / E_corr
+    # ── Tafel intersection (Ecorr, icorr from linear intersection) ──────────
     icorr_display, ecorr_display = icorr_model, Ecorr_fit
     if taf is not None and use_tafel_icorr:
         E_tafel, i_tafel, logI_tafel = taf
         if E_lo - 0.2*span <= E_tafel <= E_hi + 0.2*span and np.isfinite(i_tafel) and i_tafel > 0:
             icorr_display, ecorr_display = i_tafel, E_tafel
+    logIc_disp = np.log10(max(icorr_display, TINY))
+
+    # ── Active-zone upper bound for anodic line drawing ──────────────────────
+    # Prefer Epeak, fall back to Epass from model
+    active_upper = None
+    if an_res.get("Epeak") is not None:
+        active_upper = float(an_res["Epeak"])
+    elif ct in CT.PASS:
+        active_upper = float(best_p[4])
+
+    # ── Helper: draw a Tafel line segment + optional thin extension ──────────
+    def _tafel_line(ax, slope, intercept, win_lo, win_hi,
+                    color, lw_main=2.2, lw_ext=1.4, alpha_ext=0.45,
+                    label=None, extend_left=None, extend_right=None, clip_lo=None, clip_hi=None):
+        """
+        Draw the Tafel line within [win_lo, win_hi] as a solid line (main region),
+        then optionally extend to extend_left / extend_right as thin dashed line.
+        clip_lo / clip_hi limit the drawn range to plot axes.
+        """
+        lo = max(win_lo, clip_lo if clip_lo is not None else win_lo)
+        hi = min(win_hi, clip_hi if clip_hi is not None else win_hi)
+        if hi <= lo:
+            return
+        Eseg = np.linspace(lo, hi, 120)
+        ax.plot(Eseg, slope*Eseg + intercept, "-", color=color, lw=lw_main,
+                zorder=7, label=label)
+        # Extension toward Ecorr (left for cathodic, right for anodic)
+        if extend_left is not None and extend_left < lo:
+            el = max(extend_left, clip_lo if clip_lo is not None else extend_left)
+            if el < lo:
+                Eext = np.linspace(el, lo, 80)
+                ax.plot(Eext, slope*Eext + intercept, "--", color=color,
+                        lw=lw_ext, alpha=alpha_ext, zorder=6)
+        if extend_right is not None and extend_right > hi:
+            er = min(extend_right, clip_hi if clip_hi is not None else extend_right)
+            if er > hi:
+                Eext = np.linspace(hi, er, 80)
+                ax.plot(Eext, slope*Eext + intercept, "--", color=color,
+                        lw=lw_ext, alpha=alpha_ext, zorder=6)
 
     with plt.rc_context(PLT_RC):
-        fig = plt.figure(figsize=(14, 10), dpi=dpi)
-        gs  = GridSpec(2, 3, figure=fig,
-                       hspace=0.44, wspace=0.36,
-                       left=0.07, right=0.97, top=0.93, bottom=0.08)
-        ax_ev  = fig.add_subplot(gs[0, :])
-        ax_br  = fig.add_subplot(gs[1, 0])
-        ax_lin = fig.add_subplot(gs[1, 1])
-        ax_res = fig.add_subplot(gs[1, 2])
+        # ── 2-row layout: Evans (top, full width) + 4 region panels (bottom) ─
+        fig = plt.figure(figsize=(18, 11), dpi=dpi)
+        gs  = GridSpec(2, 4, figure=fig,
+                       hspace=0.48, wspace=0.38,
+                       left=0.06, right=0.98, top=0.93, bottom=0.08)
+        ax_ev   = fig.add_subplot(gs[0, :])       # full Evans diagram
+        ax_cat  = fig.add_subplot(gs[1, 0])        # cathodic Tafel zoom
+        ax_ano  = fig.add_subplot(gs[1, 1])        # anodic active zoom
+        ax_pass = fig.add_subplot(gs[1, 2])        # passive (+ transpassive)
+        ax_res  = fig.add_subplot(gs[1, 3])        # residuals
 
-        # ══ PANEL A — Evans Diagram ═══════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════════════
+        # PANEL A — Full Evans Diagram
+        # ══════════════════════════════════════════════════════════════════════
         ax = ax_ev
 
+        # Region shading
         if show_regions:
-            def vband(e0, e1, key, lbl):
+            def vband(ax, e0, e1, key, lbl):
                 c, a = REGION_COLORS[key]
                 e0c = float(np.clip(e0, E_lo, E_hi))
                 e1c = float(np.clip(e1, E_lo, E_hi))
                 if e1c > e0c:
                     ax.axvspan(e0c, e1c, color=c, alpha=a, lw=0, label=lbl, zorder=1)
-            vband(E_lo, Ecorr_fit, "cathodic", "Cathodic region")
+            vband(ax, E_lo, Ecorr_fit, "cathodic", "Cathodic")
             if ct in CT.SIMPLE:
-                vband(Ecorr_fit, E_hi, "active", "Anodic (active)")
+                vband(ax, Ecorr_fit, E_hi, "active", "Anodic (active)")
             elif ct in CT.PASS:
                 Ep = float(best_p[4])
                 Et = float(best_p[7]) if ct in CT.TRANS else E_hi + 1
-                vband(Ecorr_fit, min(Ep, E_hi), "active", "Active dissolution")
-                vband(min(Ep, E_hi), min(Et, E_hi), "passive", "Passive region")
+                vband(ax, Ecorr_fit, min(Ep, E_hi),    "active",       "Active dissolution")
+                vband(ax, min(Ep, E_hi), min(Et, E_hi), "passive",     "Passive region")
                 if ct in CT.TRANS and Et < E_hi:
-                    vband(Et, E_hi, "transpassive", "Transpassive / pitting")
+                    vband(ax, Et, E_hi, "transpassive", "Transpassive / pitting")
 
-        # Experimental data
-        ax.scatter(E, log_obs, s=12, color="#4a7fa8", alpha=0.60,
+        # Data + global fit
+        ax.scatter(E, log_obs, s=12, color="#4a7fa8", alpha=0.55,
                    zorder=2, label="Experimental data", linewidths=0, rasterized=True)
-        # Fitted model
         ax.plot(E_dense, log_den, color="#1a3a5c", lw=2.0, zorder=5,
-                label=f"Global fit  (R\u00b2={r2v:.5f})")
+                label=f"Global fit (R²={r2v:.5f})")
 
-        # Draw local regression segments
-        def _draw_segment(ax, slope, intercept, win, color, label,
-                          extend_to=None, extend_color=None, extend_alpha=0.35):
-            e0, e1 = float(win[0]), float(win[1])
-            e0p, e1p = max(E_lo, e0), min(E_hi, e1)
-            if e1p <= e0p: return False
-            E_seg = np.linspace(e0p, e1p, 120)
-            ax.plot(E_seg, slope * E_seg + intercept, "--", color=color, lw=2.2, zorder=6, label=label)
-            if extend_to is not None:
-                ex0, ex1 = min(e0p, extend_to[0]), max(e1p, extend_to[1])
-                ex0, ex1 = max(E_lo, ex0), min(E_hi, ex1)
-                if ex1 > e1p:
-                    E_ext = np.linspace(e1p, ex1, 60)
-                    ax.plot(E_ext, slope * E_ext + intercept, "--", color=extend_color or color, lw=1.6, alpha=extend_alpha, zorder=5)
-                if ex0 < e0p:
-                    E_ext = np.linspace(ex0, e0p, 60)
-                    ax.plot(E_ext, slope * E_ext + intercept, "--", color=extend_color or color, lw=1.6, alpha=extend_alpha, zorder=5)
-            return True
+        # ── Cathodic Tafel line (solid in window, dashed extension to Ecorr) ─
+        if "slope_c" in cat_res and "win_c" in cat_res:
+            sc, ic_int = cat_res["slope_c"], cat_res["intercept_c"]
+            wc0, wc1 = float(cat_res["win_c"][0]), float(cat_res["win_c"][1])
+            bc_lbl = f"βc = {min(abs(1/sc), CFG['beta_max_c'])*1000:.0f} mV/dec"
+            ext_r = ecorr_display if extend_tafel else None
+            _tafel_line(ax, sc, ic_int, wc0, wc1, "#8e44ad",
+                        label=bc_lbl, extend_right=ext_r,
+                        clip_lo=E_lo, clip_hi=E_hi)
 
-        # Cathodic Tafel line
-        drew_c = False
-        if ("slope_c" in cat_res) and ("intercept_c" in cat_res) and ("win_c" in cat_res):
-            lab_c = f"βc (local) = {min(abs(1.0/cat_res['slope_c']),CFG['beta_max_c'])*1000:.0f} mV/dec"
-            ext = (E_lo, min(Ecorr_fit, E_hi)) if extend_tafel else None
-            drew_c = _draw_segment(ax, cat_res["slope_c"], cat_res["intercept_c"],
-                                   cat_res["win_c"], "#8e44ad", lab_c,
-                                   extend_to=ext, extend_color="#8e44ad", extend_alpha=0.30)
+        # ── Anodic Tafel line (solid in active window, dashed extension to Ecorr) ─
+        if "slope_a" in an_res and "win_a" in an_res:
+            sa, ia_int = an_res["slope_a"], an_res["intercept_a"]
+            wa0 = float(an_res["win_a"][0])
+            # Clip right edge of anodic window to active zone (not passive!)
+            wa1 = float(an_res["win_a"][1])
+            if active_upper is not None:
+                wa1 = min(wa1, active_upper)
+            if wa1 <= wa0:
+                wa1 = wa0 + 0.010   # ensure at least 10 mV visible
+            ba_lbl = f"βa = {min(abs(1/sa), CFG['beta_max_a'])*1000:.0f} mV/dec"
+            ext_l = ecorr_display if extend_tafel else None
+            _tafel_line(ax, sa, ia_int, wa0, wa1, "#e67e22",
+                        label=ba_lbl, extend_left=ext_l,
+                        clip_lo=E_lo, clip_hi=E_hi)
 
-        # Anodic Tafel line
-        drew_a = False
-        if ("slope_a" in an_res) and ("intercept_a" in an_res):
-            if "win_a" in an_res:
-                e0, e1 = an_res["win_a"]
-                # FIX C: clip to the active region boundary (Epeak preferred, Epass as fallback).
-                # The old code clipped solely to E_pass; for near-instant passivation curves
-                # the selected window can start/end inside the passive region, making
-                # e1 < e0 after clipping and producing an invisible zero-length segment.
-                clip_upper = None
-                if an_res.get("Epeak") is not None:
-                    clip_upper = float(an_res["Epeak"])
-                elif ct in CT.PASS and best_p[4] is not None:
-                    clip_upper = float(best_p[4])
-                if clip_upper is not None:
-                    e1 = min(e1, clip_upper)
-                # If window is degenerate after clipping, expand slightly
-                if e1 <= e0:
-                    e1 = e0 + max(0.02, float(clip_upper - Ecorr_fit) * 0.5) if clip_upper else e0 + 0.05
-            else:
-                e0, e1 = Ecorr_fit, E_hi
-            lab_a = f"βa (local) = {min(abs(1.0/an_res['slope_a']),CFG['beta_max_a'])*1000:.0f} mV/dec"
-            ext = (max(Ecorr_fit, E_lo), E_hi) if extend_tafel else None
-            drew_a = _draw_segment(ax, an_res["slope_a"], an_res["intercept_a"],
-                                   (e0, e1), "#e67e22", lab_a,
-                                   extend_to=ext, extend_color="#e67e22", extend_alpha=0.30)
-
-        # Fallbacks to model partials when local lines failed
-        if not drew_c:
-            msk_cat = (logI_cat_model >= y_lo - 0.05) & (logI_cat_model <= y_hi + 0.05) & (E_dense <= Ecorr_fit + 0.005)
-            if np.any(msk_cat):
-                ax.plot(E_dense[msk_cat], logI_cat_model[msk_cat], "--", color="#8e44ad", lw=2.2, zorder=6,
-                        label=f"βc = {bc*1000:.0f} mV/dec")
-        if not drew_a:
-            if ct in CT.PASS:
-                Epass_fit = float(best_p[4])
-                msk_ano_E = (E_dense >= Ecorr_fit) & (E_dense <= Epass_fit)
-            else:
-                msk_ano_E = E_dense >= Ecorr_fit
-            msk_ano = msk_ano_E & (logI_ano_model >= y_lo - 0.05) & (logI_ano_model <= y_hi + 0.05)
-            if np.any(msk_ano):
-                ax.plot(E_dense[msk_ano], logI_ano_model[msk_ano], "--", color="#e67e22", lw=2.2, zorder=6,
-                        label=f"βa = {ba*1000:.0f} mV/dec")
-
-        # Crossing point + drop-lines
-        logIc_disp = np.log10(max(icorr_display, TINY))
-        ax.plot(ecorr_display, logIc_disp, "x", color="#e84393", ms=12, mew=2.5, zorder=8)
-        ax.plot([ecorr_display, ecorr_display], [y_lo, logIc_disp], ":", color="#e84393", lw=1.2, alpha=0.85, zorder=3)
-        ax.plot([E_lo, ecorr_display], [logIc_disp, logIc_disp], ":", color="#e84393", lw=1.2, alpha=0.85, zorder=3)
-
-        y_span = y_hi - y_lo
-        ax.annotate(f"E\u1d9c\u1d52\u02b3\u02b3 = {ecorr_display:.4f} V",
-                    xy=(ecorr_display, y_lo),
-                    xytext=(ecorr_display + 0.01*(E_hi-E_lo), y_lo + 0.04*y_span),
-                    fontsize=8.5, color="#e84393", fontweight="bold", ha="left")
-        ax.annotate(f"i\u1d9c\u1d52\u02b3\u02b3 = {icorr_display:.2e} A/cm\u00b2",
-                    xy=(E_lo, logIc_disp),
-                    xytext=(E_lo + 0.01*(E_hi-E_lo), logIc_disp + 0.03*y_span),
-                    fontsize=8.5, color="#e84393", fontweight="bold")
-
+        # i_pass horizontal line
         if ct in CT.PASS:
             ip_val = float(best_p[6])
             ax.axhline(np.log10(max(ip_val, TINY)), color="#27ae60",
-                       ls=":", lw=1.1, alpha=0.75, zorder=3,
-                       label=f"i_pass = {ip_val:.2e} A/cm\u00b2")
+                       ls=":", lw=1.2, alpha=0.80, zorder=3,
+                       label=f"i_pass = {ip_val:.2e} A/cm²")
 
-        ax.set_xlim(E_lo, E_hi)
-        ax.set_ylim(y_lo, y_hi)
+        # Intersection marker + drop lines
+        ax.plot(ecorr_display, logIc_disp, "x", color="#e84393", ms=12, mew=2.5, zorder=9)
+        ax.plot([ecorr_display]*2, [y_lo, logIc_disp], ":", color="#e84393", lw=1.2, alpha=0.9)
+        ax.plot([E_lo, ecorr_display], [logIc_disp]*2,  ":", color="#e84393", lw=1.2, alpha=0.9)
+
+        y_span = y_hi - y_lo
+        ax.annotate(f"Eᶜᵒʳʳ = {ecorr_display:.4f} V",
+                    xy=(ecorr_display, y_lo + 0.04*y_span),
+                    fontsize=8.5, color="#e84393", fontweight="bold")
+        ax.annotate(f"iᶜᵒʳʳ = {icorr_display:.2e} A/cm²",
+                    xy=(E_lo + 0.01*span, logIc_disp + 0.03*y_span),
+                    fontsize=8.5, color="#e84393", fontweight="bold")
+
+        ax.set_xlim(E_lo, E_hi); ax.set_ylim(y_lo, y_hi)
         ax.set_xlabel("E vs. Reference (V)")
-        ax.set_ylabel("log\u2081\u2080 |i| (A cm\u207b\u00b2)")
+        ax.set_ylabel("log₁₀ |i| (A cm⁻²)")
         ax.set_title(f"Evans Diagram — {sample_name}")
-        ax.xaxis.set_minor_locator(AutoMinorLocator(5))
-        ax.yaxis.set_minor_locator(AutoMinorLocator(5))
+        ax.xaxis.set_minor_locator(AutoMinorLocator(5)); ax.yaxis.set_minor_locator(AutoMinorLocator(5))
         ax.tick_params(which="both", top=True, right=True)
         ax.grid(True, which="major", ls="--", alpha=0.45)
         ax.grid(True, which="minor", ls=":", alpha=0.18)
-        ax.legend(loc="lower right", ncol=4, fontsize=7.5,
-                  framealpha=0.95, edgecolor="#cccccc")
+        ax.legend(loc="lower right", ncol=5, fontsize=7.5, framealpha=0.95, edgecolor="#cccccc")
         r2c = "#27ae60" if r2v > 0.99 else "#e67e22" if r2v > 0.95 else "#e84393"
         ax.text(0.01, 0.97,
-                f"R\u00b2={r2v:.5f}  RMSE={rmse:.4f}  Model: {CT.name(ct)}",
-                transform=ax.transAxes, fontsize=8.5, color=r2c,
-                fontweight="bold", va="top",
-                bbox=dict(fc="white", ec=r2c, alpha=0.88, pad=3,
-                          boxstyle="round,pad=0.3"))
+                f"R²={r2v:.5f}  RMSE={rmse:.4f}  Model: {CT.name(ct)}",
+                transform=ax.transAxes, fontsize=8.5, color=r2c, fontweight="bold", va="top",
+                bbox=dict(fc="white", ec=r2c, alpha=0.88, pad=3, boxstyle="round,pad=0.3"))
 
-        # ══ PANEL B — Branch Fits ═════════════════════════════════════════════
-        ax = ax_br
-        E_ds, log_obs_ds = downsample_uniform(E, log_obs, 400)
-        ax.scatter(E_ds, log_obs_ds, s=5, color="#aab4c4", alpha=0.28, zorder=1, linewidths=0, rasterized=True)
+        # ══════════════════════════════════════════════════════════════════════
+        # PANEL B — Cathodic Tafel region (zoomed)
+        # Shows the cathodic data with the fitted linear region highlighted
+        # ══════════════════════════════════════════════════════════════════════
+        ax = ax_cat
         if "E_cat" in cat_res:
-            ax.scatter(cat_res["E_cat"], cat_res["lgi_cat"],
-                       s=18, color="#6baed6", alpha=0.80, zorder=3,
-                       label="Cathodic data", linewidths=0, rasterized=True)
+            Ec_arr = cat_res["E_cat"]; lgi_c = cat_res["lgi_cat"]
+            ax.scatter(Ec_arr, lgi_c, s=20, color="#6baed6", alpha=0.75,
+                       zorder=2, label="Cathodic data", linewidths=0, rasterized=True)
+            # Highlight the fitted window
+            if "win_c" in cat_res:
+                wc0, wc1 = float(cat_res["win_c"][0]), float(cat_res["win_c"][1])
+                win_mask = (Ec_arr >= wc0 - 0.002) & (Ec_arr <= wc1 + 0.002)
+                if win_mask.sum() > 0:
+                    ax.scatter(Ec_arr[win_mask], lgi_c[win_mask],
+                               s=40, color="#2c3e8c", alpha=0.95, zorder=4,
+                               label="Tafel window", linewidths=0)
+            # Draw the fitted line over the window + extension to Ecorr
+            if "slope_c" in cat_res:
+                sc, ic_int = cat_res["slope_c"], cat_res["intercept_c"]
+                wc0, wc1 = float(cat_res["win_c"][0]), float(cat_res["win_c"][1])
+                # Solid line in window
+                E_win = np.linspace(wc0, wc1, 100)
+                ax.plot(E_win, sc*E_win + ic_int, "-", color="#8e44ad", lw=2.2, zorder=5,
+                        label=f"βc = {min(abs(1/sc), CFG['beta_max_c'])*1000:.0f} mV/dec")
+                # Dashed extension to Ecorr
+                if extend_tafel and wc1 < ecorr_display:
+                    E_ext = np.linspace(wc1, ecorr_display, 80)
+                    ax.plot(E_ext, sc*E_ext + ic_int, "--", color="#8e44ad",
+                            lw=1.4, alpha=0.50, zorder=4)
+            ax.axvline(ecorr_display, color="#e84393", ls="--", lw=1.0, alpha=0.7)
+            ax.axhline(logIc_disp, color="#e84393", ls=":", lw=0.9, alpha=0.7)
+            # Global model cathodic curve for comparison
+            cat_dense_m = E_dense <= Ecorr_fit + 0.01
+            ax.plot(E_dense[cat_dense_m], log_den[cat_dense_m],
+                    color="#1a3a5c", lw=1.5, alpha=0.60, zorder=3, ls="-",
+                    label="Global model")
+            # Axis limits: focus on the cathodic Tafel region
+            xlim_c = (float(Ec_arr.min()) - 0.01, Ecorr_fit + 0.02)
+            ylim_c_lo = float(np.nanmin(lgi_c)) - 0.1
+            ylim_c_hi = float(np.nanmax(lgi_c)) + 0.2
+            ax.set_xlim(xlim_c); ax.set_ylim(ylim_c_lo, ylim_c_hi)
+        ax.set_xlabel("E (V)"); ax.set_ylabel("log₁₀ |i|")
+        ax.set_title("Cathodic Tafel Region")
+        ax.xaxis.set_minor_locator(AutoMinorLocator(4)); ax.yaxis.set_minor_locator(AutoMinorLocator(4))
+        ax.tick_params(which="both", top=True, right=True)
+        ax.grid(True, which="major", ls="--", alpha=0.4)
+        ax.legend(fontsize=7.5)
+
+        # ══════════════════════════════════════════════════════════════════════
+        # PANEL C — Anodic active dissolution region (zoomed)
+        # ══════════════════════════════════════════════════════════════════════
+        ax = ax_ano
         if "E_an" in an_res:
-            ax.scatter(an_res["E_an"], an_res["lgi_an"],
-                       s=18, color="#fd8d3c", alpha=0.80, zorder=3,
-                       label="Anodic data", linewidths=0, rasterized=True)
-        if "slope_c" in cat_res and "intercept_c" in cat_res and "win_c" in cat_res:
-            e0, e1 = cat_res["win_c"]
-            E_seg = np.linspace(max(E_lo, e0), min(E_hi, e1), 120)
-            if len(E_seg) > 1:
-                ax.plot(E_seg, cat_res["slope_c"] * E_seg + cat_res["intercept_c"],
-                        "--", color="#3182bd", lw=1.6, zorder=4,
-                        label=f"βc(local)={min(abs(1.0/cat_res['slope_c']),CFG['beta_max_c'])*1000:.0f} mV/dec")
-        if "slope_a" in an_res and "intercept_a" in an_res:
+            Ea_arr = an_res["E_an"]; lgi_a = an_res["lgi_an"]
+            # Determine active zone upper limit
+            act_up = active_upper if active_upper is not None else float(Ea_arr.max())
+            act_mask_an = Ea_arr <= act_up + 0.010
+            Ea_act = Ea_arr[act_mask_an]; lgi_act = lgi_a[act_mask_an]
+            ax.scatter(Ea_act, lgi_act, s=20, color="#fd8d3c", alpha=0.75,
+                       zorder=2, label="Active data", linewidths=0, rasterized=True)
+            # Highlight the fitted window
             if "win_a" in an_res:
-                e0, e1 = an_res["win_a"]
-                # FIX C (panel B): same Epeak-preferred clipping
-                clip_upper_b = an_res.get("Epeak") or (float(best_p[4]) if ct in CT.PASS and best_p[4] is not None else None)
-                if clip_upper_b is not None:
-                    e1 = min(e1, float(clip_upper_b))
-                if e1 <= e0:
-                    e1 = e0 + 0.03
-            else:
-                e0, e1 = Ecorr_fit, E_hi
-            E_seg = np.linspace(max(E_lo, e0), min(E_hi, e1), 120)
-            if len(E_seg) > 1 and E_seg[-1] > E_seg[0]:
-                ax.plot(E_seg, an_res["slope_a"] * E_seg + an_res["intercept_a"],
-                        "--", color="#e6550d", lw=1.6, zorder=4,
-                        label=f"βa(local)={min(abs(1.0/an_res['slope_a']),CFG['beta_max_a'])*1000:.0f} mV/dec")
-        if an_res["has_passive"] and an_res["Epass"] is not None:
-            ax.axvline(float(an_res["Epass"]), color="#27ae60",
-                       ls="-.", lw=1.0, alpha=0.85,
-                       label=f"E_pass={an_res['Epass']:.3f}V")
-        ax.axvline(ecorr_display, color="#e84393", ls="--", lw=1.2, zorder=3)
-        ax.axhline(logIc_disp, color="#e84393", ls=":", lw=1.0, alpha=0.7)
-        ax.set_xlim(E_lo, E_hi)
-        ax.set_ylim(y_lo, y_hi)
-        ax.set_xlabel("E (V)")
-        ax.set_ylabel("log\u2081\u2080 |i|")
-        ax.set_title("Branch Fits (Stage 2–3)")
-        ax.xaxis.set_minor_locator(AutoMinorLocator(5))
-        ax.yaxis.set_minor_locator(AutoMinorLocator(5))
+                wa0 = float(an_res["win_a"][0])
+                wa1 = min(float(an_res["win_a"][1]), act_up)
+                win_mask_a = (Ea_act >= wa0 - 0.002) & (Ea_act <= wa1 + 0.002)
+                if win_mask_a.sum() > 0:
+                    ax.scatter(Ea_act[win_mask_a], lgi_act[win_mask_a],
+                               s=45, color="#c0390b", alpha=0.95, zorder=4,
+                               label="Tafel window", linewidths=0)
+            # Draw the fitted Tafel line
+            if "slope_a" in an_res and "win_a" in an_res:
+                sa, ia_int = an_res["slope_a"], an_res["intercept_a"]
+                wa0 = float(an_res["win_a"][0])
+                wa1 = min(float(an_res["win_a"][1]), act_up)
+                if wa1 > wa0:
+                    E_win_a = np.linspace(wa0, wa1, 100)
+                    ax.plot(E_win_a, sa*E_win_a + ia_int, "-", color="#e67e22", lw=2.2, zorder=5,
+                            label=f"βa = {min(abs(1/sa), CFG['beta_max_a'])*1000:.0f} mV/dec")
+                    # Dashed extension to Ecorr
+                    if extend_tafel and ecorr_display < wa0:
+                        E_ext_a = np.linspace(ecorr_display, wa0, 80)
+                        ax.plot(E_ext_a, sa*E_ext_a + ia_int, "--", color="#e67e22",
+                                lw=1.4, alpha=0.50, zorder=4)
+            ax.axvline(ecorr_display, color="#e84393", ls="--", lw=1.0, alpha=0.7)
+            ax.axhline(logIc_disp, color="#e84393", ls=":", lw=0.9, alpha=0.7)
+            # Global model anodic
+            ano_dense_m = (E_dense >= Ecorr_fit - 0.01) & (E_dense <= act_up + 0.02)
+            ax.plot(E_dense[ano_dense_m], log_den[ano_dense_m],
+                    color="#1a3a5c", lw=1.5, alpha=0.60, zorder=3, label="Global model")
+            # Axis limits: tight around active zone
+            xlim_a = (Ecorr_fit - 0.02, act_up + 0.02)
+            if len(lgi_act) > 0:
+                ylim_a_lo = float(np.nanmin(lgi_act)) - 0.1
+                ylim_a_hi = float(np.nanmax(lgi_act)) + 0.3
+                ax.set_xlim(xlim_a); ax.set_ylim(ylim_a_lo, ylim_a_hi)
+        ax.set_xlabel("E (V)"); ax.set_ylabel("log₁₀ |i|")
+        ax.set_title("Anodic Active Region")
+        ax.xaxis.set_minor_locator(AutoMinorLocator(4)); ax.yaxis.set_minor_locator(AutoMinorLocator(4))
         ax.tick_params(which="both", top=True, right=True)
         ax.grid(True, which="major", ls="--", alpha=0.4)
-        ax.legend(fontsize=7.5, loc="upper right")
+        ax.legend(fontsize=7.5)
 
-        # ══ PANEL C — Linear i vs E ═══════════════════════════════════════════
-        # FIX: ylim now based on the current range within ±150 mV of E_corr,
-        # not the global 95th percentile. Passive/transpassive peaks previously
-        # compressed the Ecorr region into an unreadable sliver. We now show
-        # the region that matters for corrosion rate visualisation.
-        ax = ax_lin
-        local_mask = np.abs(E - ecorr_display) <= 0.150
-        if np.sum(local_mask) >= 4:
-            i_local_max = float(np.percentile(np.abs(i_obs[local_mask]), 95))
+        # ══════════════════════════════════════════════════════════════════════
+        # PANEL D — Passive + Transpassive region (or Linear scale for active curves)
+        # ══════════════════════════════════════════════════════════════════════
+        ax = ax_pass
+        if ct in CT.PASS:
+            # Show passive plateau and transpassive, with model overlay
+            Ep_fit = float(best_p[4])
+            pass_mask_E = E >= Ep_fit - 0.02
+            E_pass_data  = E[pass_mask_E]; i_pass_data  = i_obs[pass_mask_E]
+            log_pass_data = slog(i_pass_data)
+            ax.scatter(E_pass_data, log_pass_data, s=14, color="#74c476", alpha=0.70,
+                       zorder=2, label="Passive / Trans data", linewidths=0, rasterized=True)
+            # Global model over this range
+            pass_dense_m = E_dense >= Ep_fit - 0.03
+            ax.plot(E_dense[pass_dense_m], log_den[pass_dense_m],
+                    color="#1a3a5c", lw=2.0, zorder=5, label="Global model")
+            # i_pass line
+            ip_val = float(best_p[6])
+            ax.axhline(np.log10(max(ip_val, TINY)), color="#27ae60",
+                       ls="--", lw=1.4, alpha=0.85, label=f"i_pass={ip_val:.2e}")
+            # Epass and Etrans markers
+            ax.axvline(Ep_fit, color="#27ae60", ls="-.", lw=1.0,
+                       label=f"E_pass={Ep_fit:.3f}V")
+            if ct in CT.TRANS:
+                Et_fit = float(best_p[7])
+                if E_lo <= Et_fit <= E_hi:
+                    ax.axvline(Et_fit, color="#9e9ac8", ls="-.", lw=1.0,
+                               label=f"E_trans={Et_fit:.3f}V")
+            # Annotate passive current
+            ax.annotate(f"ip = {ip_val:.2e}", xy=(Ep_fit + 0.01, np.log10(max(ip_val,TINY)) + 0.05),
+                        fontsize=8, color="#27ae60")
+            xlim_p = (Ep_fit - 0.03, E_hi)
+            if len(log_pass_data) > 0:
+                ylim_p_lo = float(np.nanmin(log_pass_data)) - 0.1
+                ylim_p_hi = float(np.nanmax(log_pass_data)) + 0.3
+                ax.set_xlim(xlim_p); ax.set_ylim(ylim_p_lo, ylim_p_hi)
+            ax.set_title("Passive + Transpassive Region")
         else:
-            i_local_max = float(np.percentile(np.abs(i_obs), 80))
-        # Guard: if local range is too tiny (e.g. noisy near-zero), fall back to global
-        i_global_p95 = float(np.percentile(np.abs(i_obs), 95))
-        i_scale_ref = max(i_local_max, i_global_p95 * 0.01)
-
-        if i_scale_ref < 1e-6:
-            uscale, ulbl = 1e9,  "nA/cm\u00b2"
-        elif i_scale_ref < 1e-3:
-            uscale, ulbl = 1e6,  "\u03bcA/cm\u00b2"
-        else:
-            uscale, ulbl = 1e3,  "mA/cm\u00b2"
-
-        ylim_lin = max(i_scale_ref * uscale * 1.40, 1e-12)
-
-        i_fit_cl = np.clip(i_dense * uscale, -ylim_lin * 3, ylim_lin * 3)
-        E_lin_ds, i_obs_lin_ds = downsample_uniform(E, i_obs, 800)
-        ax.scatter(E_lin_ds, i_obs_lin_ds * uscale, s=9, color="#4a7fa8",
-                   alpha=0.65, zorder=2, label="Data", linewidths=0, rasterized=True)
-        ax.plot(E_dense, i_fit_cl, color="#1a3a5c", lw=2.0, zorder=5, label="Fit")
-        ax.axhline(0, color="#888", lw=0.7, zorder=1)
-        ax.axvline(ecorr_display, color="#e84393", ls="--", lw=1.2, zorder=3,
-                   label=f"E_corr")
-        ax.set_xlim(E_lo, E_hi)
-        ax.set_ylim(-ylim_lin, ylim_lin)
+            # For non-passive curves: show linear i vs E (Stern plot)
+            local_m = np.abs(E - ecorr_display) <= 0.150
+            i_ref = float(np.percentile(np.abs(i_obs[local_m]), 95)) if local_m.sum() >= 4 else float(np.percentile(np.abs(i_obs), 80))
+            uscale = 1e9 if i_ref < 1e-6 else 1e6 if i_ref < 1e-3 else 1e3
+            ulbl   = "nA/cm²" if i_ref < 1e-6 else "μA/cm²" if i_ref < 1e-3 else "mA/cm²"
+            ylim_l = max(i_ref * uscale * 1.4, 1e-12)
+            ax.scatter(E, i_obs*uscale, s=9, color="#4a7fa8", alpha=0.6, label="Data", linewidths=0, rasterized=True)
+            ax.plot(E_dense, np.clip(i_dense*uscale, -ylim_l*3, ylim_l*3), color="#1a3a5c", lw=2, label="Fit")
+            ax.axhline(0, color="#888", lw=0.7); ax.axvline(ecorr_display, color="#e84393", ls="--", lw=1.0)
+            ax.set_xlim(E_lo, E_hi); ax.set_ylim(-ylim_l, ylim_l)
+            ax.set_ylabel(f"i ({ulbl})")
+            ax.set_title("Linear Scale (Stern plot)")
         ax.set_xlabel("E (V)")
-        ax.set_ylabel(f"i ({ulbl})")
-        ax.set_title("Linear Scale (±150 mV zoom)")
-        ax.xaxis.set_minor_locator(AutoMinorLocator(5))
-        ax.yaxis.set_minor_locator(AutoMinorLocator(5))
+        ax.xaxis.set_minor_locator(AutoMinorLocator(4)); ax.yaxis.set_minor_locator(AutoMinorLocator(4))
         ax.tick_params(which="both", top=True, right=True)
         ax.grid(True, which="major", ls="--", alpha=0.4)
-        ax.legend(fontsize=8)
+        ax.legend(fontsize=7.5)
 
-        # ══ PANEL D — Residuals ═══════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════════════
+        # PANEL E — Residuals (Δ log|i| vs E)
+        # ══════════════════════════════════════════════════════════════════════
         ax = ax_res
         ax.fill_between([E_lo, E_hi], -0.1, 0.1, color="#e84393", alpha=0.07, zorder=1)
-        ax.scatter(E, residuals, s=10, color="#2e86de", alpha=0.65, zorder=3, linewidths=0, rasterized=True)
-        ax.axhline(0,    color="#333",    lw=0.9, zorder=2)
-        ax.axhline( 0.1, color="#e84393", ls=":", lw=1.0, alpha=0.7)
-        ax.axhline(-0.1, color="#e84393", ls=":", lw=1.0, alpha=0.7, label="\u00b10.1 log")
+        ax.scatter(E, residuals, s=10, color="#2e86de", alpha=0.65, zorder=3,
+                   linewidths=0, rasterized=True)
+        ax.axhline(0,     color="#333",    lw=0.9, zorder=2)
+        ax.axhline( 0.1,  color="#e84393", ls=":", lw=1.0, alpha=0.7)
+        ax.axhline(-0.1,  color="#e84393", ls=":", lw=1.0, alpha=0.7, label="±0.1 log")
         ax.axvline(ecorr_display, color="#e84393", ls="--", lw=0.9, alpha=0.6)
+        # Region delimiters in residual plot
+        if ct in CT.PASS:
+            ax.axvline(float(best_p[4]), color="#27ae60", ls="-.", lw=0.8, alpha=0.5)
+            if ct in CT.TRANS:
+                ax.axvline(float(best_p[7]), color="#9e9ac8", ls="-.", lw=0.8, alpha=0.5)
         ax.set_xlim(E_lo, E_hi)
-        ax.set_xlabel("E (V)")
-        ax.set_ylabel("\u0394 log\u2081\u2080 |i|")
-        ax.set_title(f"Residuals   R\u00b2={r2v:.5f}")
-        ax.xaxis.set_minor_locator(AutoMinorLocator(5))
-        ax.yaxis.set_minor_locator(AutoMinorLocator(5))
+        ax.set_xlabel("E (V)"); ax.set_ylabel("Δ log₁₀ |i|")
+        ax.set_title(f"Residuals   R²={r2v:.5f}")
+        ax.xaxis.set_minor_locator(AutoMinorLocator(4)); ax.yaxis.set_minor_locator(AutoMinorLocator(4))
         ax.tick_params(which="both", top=True, right=True)
         ax.grid(True, which="major", ls="--", alpha=0.4)
         ax.legend(fontsize=8)
@@ -1674,17 +1735,24 @@ with tab_fit:
 
                     # Stage 2 — Cathodic
                     cat_res = fit_cathodic(E, i, Ecorr)
+                    win_c_str = f"  win=[`{cat_res['win_c'][0]:.4f}`, `{cat_res['win_c'][1]:.4f}`]V" if 'win_c' in cat_res else ""
                     log(f"✅ **Stage 2** — βc(local) = `{cat_res['bc']*1000:.0f}` mV/dec  "
                         f"i_corr ≈ `{cat_res['icorr']:.2e}`  "
                         f"R²_cat = `{cat_res['r2']:.4f}`  "
-                        f"diff_limit = `{'yes' if cat_res['has_diff'] else 'no'}`")
+                        f"diff_limit = `{'yes' if cat_res['has_diff'] else 'no'}`"
+                        f"{win_c_str}")
                     prog.progress(30, text="Stage 3 — Anodic branch fit…")
 
                     # Stage 3 — Anodic
                     an_res = fit_anodic(E, i, Ecorr)
-                    log(f"✅ **Stage 3** — βa(local) = `{an_res['ba']*1000:.0f}` mV/dec  "
-                        f"passive = `{'yes  E_pass=%.4f V' % an_res['Epass'] if an_res['has_passive'] else 'no'}`  "
-                        f"transpassive = `{'yes' if an_res['has_trans'] else 'no'}`")
+                    epeak_str = f"  Epeak=`{an_res['Epeak']:.4f}V`" if an_res.get('Epeak') else ""
+                    epass_str = f"  E_pass=`{an_res['Epass']:.4f}V`  ip=`{an_res['ip']:.2e}`" if an_res['has_passive'] else ""
+                    etrans_str = f"  E_trans=`{an_res['Etrans']:.4f}V`" if an_res.get('has_trans') and an_res.get('Etrans') else ""
+                    log(f"✅ **Stage 3** — βa(local) = `{an_res['ba']*1000:.0f}` mV/dec"
+                        f"{epeak_str}"
+                        f"  passive = `{'yes' if an_res['has_passive'] else 'no'}`{epass_str}"
+                        f"  transpassive = `{'yes' if an_res['has_trans'] else 'no'}`{etrans_str}"
+                        f"  R²_ano = `{an_res['r2']:.4f}`")
                     prog.progress(45, text="Stage 4 — Classifying curve type…")
 
                     # Stage 4 — Classify
@@ -1698,19 +1766,22 @@ with tab_fit:
 
                     force_choice = st.session_state.get("force_ct_choice", "auto")
                     if force_choice == "auto":
-                        candidates = [ct_detected]
-                        if ct_detected in (CT.A, CT.AD):
-                            candidates.append(CT.P)
-                        if an_res["has_passive"]:
-                            candidates.extend([CT.P, CT.PT])
-                            # Always try F (full model with iL) for passive curves —
-                            # the cathodic diffusion detection can miss subtle plateaus,
-                            # but the global model can still pick up iL from the data.
-                            candidates.append(CT.F)
-                        if cat_res["has_diff"]:
-                            candidates.append(CT.AD)
-                            if an_res["has_passive"]:
-                                candidates.append(CT.F)
+                        # Build candidate set. F (Full: passive+diffusion) is always
+                        # tried when both passive and diffusion features are present — the
+                        # local detection is conservative and can miss one of them.
+                        candidates = []
+                        if an_res["has_passive"] and cat_res["has_diff"]:
+                            # Both features: F is the most likely correct model
+                            candidates = [CT.F, CT.PT, CT.P, CT.AD]
+                        elif an_res["has_passive"]:
+                            candidates = [CT.PT, CT.P, CT.F]
+                        elif cat_res["has_diff"]:
+                            candidates = [CT.AD, CT.A, CT.P]
+                        else:
+                            candidates = [ct_detected, CT.P]
+                        # Always include the auto-detected type
+                        if ct_detected not in candidates:
+                            candidates.insert(0, ct_detected)
                         seen = set(); uniq = []
                         for c in candidates:
                             if c not in seen:
@@ -1733,12 +1804,13 @@ with tab_fit:
                                             params=bp, success=r2v > 0.90))
                         log(f"  · {CT.name(ct_try):35s} R² = `{r2v:.6f}`  AICc = `{aic_v:.1f}`")
 
-                    # AICc selection — parsimony
+                    # AICc selection — lowest AICc wins, but allow a simpler model
+                    # only if it costs < 0.5% R² (not 0.2% — too tight for noisy data).
                     all_res.sort(key=lambda x: x["aicc"])
                     best_r = all_res[0]
                     for r in all_res:
                         if (CT.nfree(r["ct"]) < CT.nfree(best_r["ct"])
-                                and best_r["r2"] - r["r2"] < 0.002):
+                                and best_r["r2"] - r["r2"] < 0.005):
                             best_r = r; break
 
                     best_p  = best_r["params"]
@@ -1827,6 +1899,38 @@ with tab_fit:
                         mc2[3].metric("E_pass (V)",     f"{p[4]:.5f}")
                     if best_ct in CT.TRANS:
                         mc2[4].metric("E_trans (V)",    f"{p[7]:.5f}")
+
+                    # ── Per-region local linear fit summary ──────────────────
+                    st.markdown("#### 🔬 Local Linear Fits by Region")
+                    rr_cols = st.columns(3)
+                    with rr_cols[0]:
+                        st.markdown("**Cathodic Tafel**")
+                        if "win_c" in cat_res:
+                            st.markdown(
+                                f"- Window: `{cat_res['win_c'][0]:.4f}` → `{cat_res['win_c'][1]:.4f}` V  \n"
+                                f"- βc = **{cat_res['bc']*1000:.1f} mV/dec**  \n"
+                                f"- R² = `{cat_res['r2']:.4f}`  \n"
+                                f"- Diff. limit: `{'yes' if cat_res['has_diff'] else 'no'}`"
+                                + (f"  \n- iL ≈ `{cat_res['iL']:.3e}` A/cm²" if cat_res['has_diff'] else ""))
+                    with rr_cols[1]:
+                        st.markdown("**Anodic Active Tafel**")
+                        if "win_a" in an_res:
+                            active_up2 = an_res.get("Epeak") or (float(p[4]) if best_ct in CT.PASS else None)
+                            wa1_disp = min(float(an_res["win_a"][1]), active_up2) if active_up2 else float(an_res["win_a"][1])
+                            st.markdown(
+                                f"- Window: `{an_res['win_a'][0]:.4f}` → `{wa1_disp:.4f}` V  \n"
+                                f"- βa = **{an_res['ba']*1000:.1f} mV/dec**  \n"
+                                f"- R² = `{an_res['r2']:.4f}`  \n"
+                                + (f"- Epeak ≈ `{an_res['Epeak']:.4f}` V" if an_res.get('Epeak') else ""))
+                    with rr_cols[2]:
+                        if best_ct in CT.PASS:
+                            st.markdown("**Passive Region**")
+                            st.markdown(
+                                f"- E_pass = `{p[4]:.4f}` V (model)  \n"
+                                f"- i_pass = `{p[6]:.3e}` A/cm²  \n"
+                                + (f"- E_trans = `{p[7]:.4f}` V" if best_ct in CT.TRANS else "- Transpassive: not detected"))
+                        else:
+                            st.markdown("**No passive region detected**")
 
                     if len(all_res) > 1:
                         st.markdown("**🏆 Model Comparison (AICc)**")
