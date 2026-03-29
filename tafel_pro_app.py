@@ -1382,6 +1382,117 @@ def export_pdf(results_list, png_list):
     doc.build(story)
     buf.seek(0); return buf
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE LOADING
+# ─────────────────────────────────────────────────────────────────────────────
+def load_file(uploaded_file):
+    """
+    Parse an uploaded CSV / TXT / XLSX file into a clean DataFrame.
+    Tries multiple separators and encodings. Returns a DataFrame with
+    numeric columns only, skipping header/comment rows automatically.
+    """
+    import io as _io
+    name = uploaded_file.name.lower()
+    raw  = uploaded_file.read()
+    uploaded_file.seek(0)
+
+    # ── Excel ────────────────────────────────────────────────────────────────
+    if name.endswith((".xlsx", ".xls")):
+        for sheet in [0, None]:
+            try:
+                df = pd.read_excel(_io.BytesIO(raw), sheet_name=sheet,
+                                   header=None, engine="openpyxl")
+                return _clean_df(df)
+            except Exception:
+                pass
+        raise ValueError("Cannot read Excel file.")
+
+    # ── Text / CSV ────────────────────────────────────────────────────────────
+    for enc in ("utf-8", "latin-1", "cp1252"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            pass
+    else:
+        text = raw.decode("utf-8", errors="replace")
+
+    for sep in (",", ";", "\t", r"\s+"):
+        try:
+            df = pd.read_csv(_io.StringIO(text), sep=sep, header=None,
+                             engine="python", comment="#", skip_blank_lines=True)
+            df = _clean_df(df)
+            if len(df.columns) >= 2 and len(df) >= 4:
+                return df
+        except Exception:
+            continue
+    raise ValueError("Cannot parse file.")
+
+def _clean_df(df):
+    """Drop non-numeric rows/columns and assign simple integer column names."""
+    # Try to find a header row (first row where ≥2 cells look like column names)
+    header_row = None
+    for idx, row in df.iterrows():
+        non_num = sum(1 for v in row if not _is_num(v))
+        if non_num >= 2:
+            header_row = idx
+            break
+    if header_row is not None:
+        df.columns = [str(v) for v in df.iloc[header_row]]
+        df = df.iloc[header_row + 1:].reset_index(drop=True)
+    # Keep only columns that have numeric data
+    num_cols = []
+    for c in df.columns:
+        try:
+            s = pd.to_numeric(df[c], errors="coerce")
+            if s.notna().sum() >= 4:
+                df[c] = s
+                num_cols.append(c)
+        except Exception:
+            pass
+    if len(num_cols) < 2:
+        # Fallback: rename columns to integers and coerce everything
+        df = df.apply(pd.to_numeric, errors="coerce").dropna(axis=1, how="all")
+        df.columns = list(range(len(df.columns)))
+        try:
+            return df.dropna(axis=1, how="all")
+        except Exception:
+            raise ValueError("Cannot parse file.")
+    return df[num_cols].dropna(how="all")
+
+def _is_num(val):
+    try:
+        float(str(val).replace(",", "."))
+        return True
+    except (ValueError, TypeError):
+        return False
+
+def _auto_cols(df):
+    """Guess E and i columns by name or by sign profile."""
+    cols = list(df.columns)
+    # Name-based heuristic
+    e_col = i_col = None
+    for c in cols:
+        cl = str(c).lower()
+        if any(k in cl for k in ("potential", "voltage", " e ", "ewe", "e/v", "e_v", "e(v")):
+            e_col = c
+        if any(k in cl for k in ("current", "density", " i ", "i/a", "i_a", "i(a", "ima", "ima/cm")):
+            i_col = c
+    if e_col and i_col:
+        return e_col, i_col, None
+    # Magnitude heuristic: E column has values in [-2, 2], i column has sign changes
+    num = df.select_dtypes(include="number")
+    best_e = best_i = None
+    for c in num.columns:
+        v = num[c].dropna().values
+        if len(v) < 4: continue
+        if -3 < float(v.mean()) < 3 and float(v.std()) < 2:
+            best_e = c
+        if np.any(np.diff(np.sign(v)) != 0):
+            best_i = c
+    return (best_e or cols[0]), (best_i or (cols[1] if len(cols)>1 else cols[0])), None
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SESSION STATE
 # ─────────────────────────────────────────────────────────────────────────────
