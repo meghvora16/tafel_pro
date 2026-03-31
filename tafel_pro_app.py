@@ -99,7 +99,7 @@ MATERIALS = {
 # Global detection settings (overridden by sidebar "Advanced")
 CFG = dict(
     cath_guard=0.020,      # V — min distance of cathodic window from Ecorr
-    anod_guard=0.010,      # V — min distance of anodic window from Ecorr
+    anod_guard=0.030,      # V — min distance of anodic window from Ecorr (skip mixed-control zone)
     curvature_max=40.0,    # max |d2 log|i| / dE^2| inside window
     lin_frac=0.70,         # fraction of derivative signs consistent with slope
     min_w_cat=4,           # minimum window length (cathodic)
@@ -285,345 +285,218 @@ def _theil_sen(x, y):
     return slope, intercept
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STAGE 2 — CATHODIC BRANCH FIT  (PolCurveFit minimum-curvature approach)
+# STAGE 2 — CATHODIC BRANCH FIT  (reference-style inverted regression)
 # ─────────────────────────────────────────────────────────────────────────────
+def _best_seg(E_seg, log_i_seg, min_pts=8, require_positive_slope=False):
+    """
+    Find the most linear sub-window in an E vs log|i| dataset.
+
+    Uses the inverted Tafel regression: E = b * log|i| + c
+    (slope b has units V/dec directly, same as Tafel slope convention).
+    Scorer: pure R² — highest R² wins. Window width: 40% of search range.
+    This is the same approach used in the reference working code.
+
+    require_positive_slope: if True, reject windows with slope <= 0
+      (used for anodic branch to avoid mixed-control zone contamination).
+
+    Returns (slope, intercept, r², window_mask) or (None, None, 0, None).
+    """
+    from scipy.stats import linregress as _lr
+    n = len(E_seg)
+    if n < min_pts:
+        return None, None, 0, None
+    wsz = max(min_pts, int(n * 0.40))
+    step = max(1, n // 20)
+    best = (-1.0, None, None, 0, wsz)
+    for s in range(0, n - wsz + 1, step):
+        e = s + wsz
+        sl, ic, r, *_ = _lr(log_i_seg[s:e], E_seg[s:e])
+        if require_positive_slope and sl <= 0:
+            continue
+        if r ** 2 > best[0]:
+            best = (r ** 2, sl, ic, s, e)
+    if best[1] is None:
+        return None, None, 0, None
+    r2, sl, ic, s, e = best
+    mask = np.zeros(n, dtype=bool)
+    mask[s:e] = True
+    return sl, ic, float(r2), mask
+
+
 def fit_cathodic(E, i, Ecorr):
     """
-    Find the cathodic Tafel linear region using the PolCurveFit
-    minimum-curvature criterion:
-      score = mean|d²(log|i|)/dE²| / R²  (lower = more linear = better Tafel)
-    This directly identifies the window where the log|i|–E relationship is
-    most linear, which is the definition of the Tafel region.
-    All windows with a physically impossible slope are excluded first.
+    Fit the cathodic Tafel region using inverted regression (E = b*log|i| + c).
+
+    Pipeline (from reference working code):
+      1. Reverse cathodic array so index 0 = Ecorr, index -1 = deep scan end.
+      2. Detect diffusion plateau: last 20% of reversed array flat (std/mean < 8%).
+      3. Tafel search zone: [Ecorr−20mV ... plateau_start+50mV].
+      4. Slide a 40%-wide window, pick highest R².
+      5. Refine with Theil-Sen inside the identified window.
     """
-    cat = i < 0
-    if np.sum(cat) < 4:
-        return dict(bc=0.120, icorr=1e-8, iL=1e-4, has_diff=False, r2=0.0)
-
-    Ec  = E[cat]; lgi = slog(i[cat])
-    si  = np.argsort(Ec); Ec, lgi = Ec[si], lgi[si]
-
-    # ── Remove diffusion plateau top (flat region at most negative cathodic E) ──
-    # Trim the top 0.8 decades (plateau) so the Tafel region dominates
-    lgi_max = float(np.max(lgi))
-    # 1.5 dec trim: removes plateau AND transition zone.
-    # 0.8 was insufficient — plateau-to-Tafel transition had near-zero
-    # d2Y and competed with the Tafel region → gave bc=233 on real SS data.
-    trim_mask = lgi < lgi_max - 1.5
-    if np.sum(trim_mask) < CFG["min_w_cat"] + 2:
-        trim_mask = lgi < lgi_max - 0.8
-    if np.sum(trim_mask) < CFG["min_w_cat"] + 2:
-        trim_mask = lgi < lgi_max - 0.3
-    if np.sum(trim_mask) < CFG["min_w_cat"]:
-        trim_mask = np.ones(len(lgi), bool)
-
-    Ex, Yx = Ec[trim_mask], lgi[trim_mask]
-    if len(Ex) < CFG["min_w_cat"]:
-        return dict(bc=0.120, icorr=1e-12, iL=1e-4, has_diff=False, r2=0.0,
-                    E_cat=Ec, lgi_cat=lgi)
-
-    # Smooth for robust second-derivative estimate
-    w_sm = max(5, min(11, len(Ex) // 2 * 2 - 1))
-    Y_sm = savgol_filter(Yx, w_sm, 3, mode="interp")
-    d2Y  = np.gradient(np.gradient(Y_sm, Ex), Ex)
-
-    # ── PolCurveFit: minimum-curvature rolling window ─────────────────────────
-    # Score each window by mean(|d²Y|)/R² — the window with the most linear
-    # log|i|–E behaviour (smallest second derivative, highest R²) is the Tafel region.
-    best_sl  = None; best_int = None; best_r2 = 0.0
-    best_E0  = None; best_E1  = None; best_score = 1e18
-    MIN_W    = max(CFG["min_w_cat"], 6)
-
     from scipy.stats import linregress as _lr
-    for win in range(MIN_W, min(50, len(Ex) + 1)):
-        for s in range(0, len(Ex) - win + 1):
-            e = s + win
-            curv = float(np.mean(np.abs(d2Y[s:e])))
-            sl, inter, r, *_ = _lr(Ex[s:e], Yx[s:e])
-            invm = abs(1.0 / sl) * 1000.0 if abs(sl) > 1e-10 else 9999.0
-            # Physical gate: cathodic slope must be negative and in range
-            if sl >= 0 or invm < CFG["beta_min"] * 1000 or invm > CFG["beta_max_c"] * 1000:
-                continue
-            if r ** 2 < 0.95:
-                continue
-            # PolCurveFit score: lower curvature AND higher R² wins
-            # Length bonus: prefer longer windows (more stable slope estimate)
-            score = curv / max(r ** 2, 0.01) / np.log1p(win)
-            if score < best_score:
-                best_score = score
-                best_sl, best_int, best_r2 = sl, inter, r ** 2
-                best_E0, best_E1 = float(Ex[s]), float(Ex[e - 1])
+    cat = (i < 0)
+    if np.sum(cat) < 8:
+        return dict(bc=0.120, icorr=1e-12, iL=1e-4, has_diff=False, r2=0.0)
 
-    if best_sl is None:
-        # Fallback: steepest window with any R²
-        for win in range(MIN_W, min(30, len(Ex) + 1)):
-            for s in range(0, len(Ex) - win + 1):
-                e = s + win
-                sl, inter, r, *_ = _lr(Ex[s:e], Yx[s:e])
-                invm = abs(1.0 / sl) * 1000.0 if abs(sl) > 1e-10 else 9999.0
-                if sl < 0 and 20 < invm < 300 and r**2 > 0.80:
-                    if best_sl is None or abs(sl) > abs(best_sl):
-                        best_sl, best_int, best_r2 = sl, inter, r**2
-                        best_E0, best_E1 = float(Ex[s]), float(Ex[e-1])
+    # Reverse: Ecorr first, deep scan last
+    Ec = E[cat]; Ic = np.abs(i[cat])
+    si = np.argsort(Ec)[::-1]
+    Ec = Ec[si]; Ic = Ic[si]
 
-    if best_sl is None:
-        # Ultimate fallback: Theil-Sen on full trimmed data
-        best_sl, best_int = _theil_sen(Ex, Yx)
-        best_r2 = r2_score(Yx, best_sl * Ex + best_int)
-        best_E0, best_E1 = float(Ex[0]), float(Ex[-1])
+    # ── Plateau detection ────────────────────────────────────────────────────
+    n_t = max(4, int(len(Ic) * 0.20))
+    tail_i = Ic[-n_t:]; tail_E = Ec[-n_t:]
+    mt = float(np.mean(tail_i)); st = float(np.std(tail_i))
+    has_diff = (mt > TINY) and (st / mt < 0.08)
+    iL_val   = mt if has_diff else float(Ic.max()) * 10
+    E_plat   = float(tail_E[0]) if has_diff else float(Ec[-1])
 
-    # Refine with Theil-Sen + Huber on the identified window
-    win_mask = (Ex >= best_E0 - 1e-9) & (Ex <= best_E1 + 1e-9)
-    Ex_w, Yx_w = Ex[win_mask], Yx[win_mask]
-    sl_ts, b_ts = _theil_sen(Ex_w, Yx_w)
-    sl_hb, b_hb = _huber_fit(Ex_w, Yx_w, best_sl, best_int)
+    # ── Tafel search zone ────────────────────────────────────────────────────
+    end_E = (E_plat + 0.05) if has_diff else float(Ec[-1])
+    msk = (Ec < Ecorr - 0.015) & (Ec > end_E)
+    if np.sum(msk) < 8:
+        msk = Ec < Ecorr - 0.005   # relax guard
 
-    def _r2l(sl, b): return r2_score(Yx_w, sl * Ex_w + b)
-    candidates = [(sl_ts, b_ts, _r2l(sl_ts, b_ts)),
-                  (sl_hb, b_hb, _r2l(sl_hb, b_hb)),
-                  (best_sl, best_int, best_r2)]
-    sl_ref, b_ref, r2_fin = max(candidates, key=lambda t: t[2])
-    # Guard against drift to unphysical slope
-    if sl_ref >= 0 or abs(1.0 / sl_ref) * 1000 > CFG["beta_max_c"] * 1000 * 1.5:
-        sl_ref, b_ref, r2_fin = best_sl, best_int, best_r2
+    Eu = Ec[msk]; liu = np.log10(np.maximum(Ic[msk], TINY))
+    if len(Eu) < 6:
+        return dict(bc=0.120, icorr=1e-12, iL=iL_val, has_diff=has_diff, r2=0.0,
+                    E_cat=Ec, lgi_cat=np.log10(np.maximum(Ic, TINY)))
 
-    bc  = min(abs(1.0 / sl_ref), CFG["beta_max_c"]) if abs(sl_ref) > 1e-9 else 0.120
-    # Tafel extrapolation to Ecorr → icorr estimate
-    icorr_tafel = 10.0 ** (b_ref + sl_ref * Ecorr) if abs(sl_ref) > 1e-9 else 1e-12
-    near = np.abs(Ec - Ecorr) < 0.050
-    icorr_near  = float(np.percentile(np.abs(i[cat][si][near]), 25)) if np.any(near) else icorr_tafel
-    icorr = max(icorr_tafel, icorr_near * 0.5)
-    icorr = max(icorr, 1e-15)
+    # ── Inverted regression ──────────────────────────────────────────────────
+    sl, ic_int, r2, mask = _best_seg(Eu, liu)
+    if sl is None:
+        sl, ic_int = _theil_sen(liu, Eu)   # Theil-Sen fallback (still E=f(log|i|))
+        r2 = 0.0; mask = np.ones(len(Eu), bool)
 
-    # ── Diffusion plateau detection ──────────────────────────────────────────
-    iL, has_diff = None, False
-    if len(Ec) > 6:
-        lgi_sm = savgol_filter(lgi, max(5, min(9, len(Ec) // 2 * 2 - 1)), 3, mode="interp")
-        dlg    = np.abs(np.gradient(lgi_sm, Ec))
-        # Plateau: slope < 30% of max (very flat)
-        flat_thr = max(np.percentile(dlg, 25), 0.3)
-        flat     = dlg < flat_thr
-        runs = [(k, list(g)) for k, g in groupby(enumerate(flat), key=lambda x: x[1]) if k]
-        if runs:
-            best_run = max(runs, key=lambda x: len(x[1]))[1]
-            idxs = [s[0] for s in best_run]
-            if len(idxs) >= 3 and abs(Ec[idxs[-1]] - Ec[idxs[0]]) > 0.03:
-                iL = float(np.median(np.abs(i[cat][si][idxs]))); has_diff = True
-    if iL is None:
-        iL = icorr * 1e4
+    bc_v  = min(abs(sl), CFG["beta_max_c"]) if abs(sl) > 1e-9 else 0.120
+    # icorr by extrapolation: at E=Ecorr, log(i) = (Ecorr-ic_int)/sl
+    icorr = 10 ** ((Ecorr - ic_int) / sl) if abs(sl) > 1e-9 else 1e-12
+    icorr = max(icorr, 1e-18)
 
+    win_lo = float(Eu[mask].min()); win_hi = float(Eu[mask].max())
+    lgi_cat = np.log10(np.maximum(Ic, TINY))
     return dict(
-        bc=bc, icorr=icorr, iL=iL, has_diff=has_diff,
-        r2=float(r2_fin),
-        E_cat=Ec, lgi_cat=lgi,
-        slope_c=sl_ref, intercept_c=b_ref,
-        win_c=(best_E0, best_E1)
+        bc=bc_v, icorr=icorr, iL=iL_val, has_diff=has_diff, r2=float(r2),
+        slope_c=float(sl), intercept_c=float(ic_int),
+        win_c=(win_lo, win_hi),
+        E_cat=Ec, lgi_cat=lgi_cat
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STAGE 3 — ANODIC BRANCH FIT  (PolCurveFit minimum-curvature approach)
+# STAGE 3 — ANODIC BRANCH FIT  (reference-style inverted regression)
 # ─────────────────────────────────────────────────────────────────────────────
 def fit_anodic(E, i, Ecorr):
     """
-    Find the anodic (active dissolution) Tafel linear region.
+    Fit the anodic active Tafel region using inverted regression (E = b*log|i| + c).
 
-    Step 1 — Detect active zone upper bound (Epeak):
-      The active dissolution peak is the first sign-change in d(log|i|)/dE
-      above Ecorr and within 200 mV. If absent, a derivative-drop threshold
-      is used to locate the end of the steep active Tafel region.
-
-    Step 2 — Minimum-curvature linear region (PolCurveFit):
-      Same scoring as fit_cathodic but for positive slope.
-
-    Step 3 — Passive / Transpassive detection (post active zone):
-      - Passive plateau: flat run in log|i| after the active zone
-      - Transpassive: derivative rise above plateau
+    Pipeline:
+      1. Passive plateau detection: flat run in log|i| after the active zone
+         (dual threshold: relative 4×p10 OR absolute 1.5 dec/V).
+      2. Epeak detection: first +→- sign change in d(log|i|)/dE within 200 mV.
+      3. Active zone: [Ecorr+10mV ... Epeak or Epass].
+      4. Slide 40%-wide window, pick highest R².
+      5. Transpassive detection from post-passive derivative rise.
     """
-    ano = i > 0
+    from itertools import groupby as _groupby
+    ano = (i > 0) & (E > Ecorr)
     if np.sum(ano) < 4:
-        return dict(ba=0.060, has_passive=False, Epass=None, ip=1e-6,
-                    has_trans=False, Etrans=None, r2=0.0)
+        return dict(ba=0.060, has_passive=False, Epass=None, ip=1e-9,
+                    has_trans=False, Etrans=None, Epeak=None, r2=0.0)
 
-    Ea  = E[ano]; lgia = slog(i[ano])
-    si  = np.argsort(Ea); Ea, lgia = Ea[si], lgia[si]
+    Ea = E[ano]; Ia = i[ano]
+    si = np.argsort(Ea); Ea = Ea[si]; Ia = Ia[si]
+    lgia = np.log10(np.maximum(Ia, TINY))
 
-    from scipy.stats import linregress as _lr
-
-    # Initialize passive flags early (needed for E_upper logic below)
-    has_passive = False; Epass = None; ip = 1e-6
+    # ── Initialize passive flags early (needed before E_upper logic) ─────────
+    has_passive = False; Epass = None; ip = 1e-9
     has_trans   = False; Etrans = None
 
-    # ── Step 1: Detect Epeak (active dissolution peak) ────────────────────────
-    # Use a SHORT smoothing window (w=9 max) to preserve sharp peaks.
-    Epeak_detected = None
-    w_pk = max(5, min(9, len(Ea) // 2 * 2 - 1))
-    lgia_pk = savgol_filter(lgia, w_pk, 3, mode="interp")
-    dY_pk   = np.gradient(lgia_pk, Ea)
-
-    # Primary: first +→- sign change within 200 mV of Ecorr
-    sc_idx = np.where(np.diff(np.sign(dY_pk)) < 0)[0]
-    cands_200 = [Ea[k] for k in sc_idx
-                 if Ecorr + 0.005 < Ea[k] < Ecorr + 0.200]
-    if cands_200:
-        Epeak_detected = float(min(cands_200))
-    else:
-        # Secondary: find_peaks within 200 mV
-        pks, _ = find_peaks(lgia_pk, prominence=0.05, distance=2)
-        pks_act = [p for p in pks if Ecorr + 0.005 < Ea[p] < Ecorr + 0.200]
-        if pks_act:
-            Epeak_detected = float(Ea[min(pks_act, key=lambda p: abs(Ea[p] - Ecorr))])
-
-    # ── Step 2: Active zone mask (Ecorr+guard → Epeak) ────────────────────────
-    base_mask = Ea > (Ecorr + CFG["anod_guard"])
-    if np.sum(base_mask) < CFG["min_w_ano"]:
-        base_mask = np.ones(len(Ea), bool)
-
-    # E_upper bounds the active window to the dissolution zone only.
-    # For active-passive curves: Epeak is the most reliable bound.
-    # Derivative-drop fallback only when passive IS detected — on simple active
-    # curves there is no transition to detect, and the drop fires prematurely
-    # in the mixed-control zone, cutting the window before the Tafel region.
-    E_upper = None
-    if Epeak_detected is not None:
-        E_upper = Epeak_detected
-    elif has_passive and Epass is not None:
-        # Passive detected: bound to passive onset (more conservative than Epeak)
-        E_upper = Epass
-    elif has_passive:
-        # Passive detected but Epass unknown: use derivative-drop
-        w_tmp = max(5, min(11, len(Ea) // 2 * 2 - 1))
-        Y_tmp = savgol_filter(lgia, w_tmp, 3, mode="interp")
-        dY_abs = np.abs(np.gradient(Y_tmp, Ea))
-        near_m = (Ea > Ecorr + CFG["anod_guard"]) & (Ea < Ecorr + 0.30)
-        if np.sum(near_m) >= 4:
-            mxsl = float(np.max(dY_abs[near_m]))
-            drop_cands = np.where(dY_abs < 0.35 * mxsl)[0]
-            for _k in range(len(drop_cands) - 1):
-                idx = drop_cands[_k]
-                if drop_cands[_k + 1] == idx + 1 and Ea[idx] > Ecorr + 0.015:
-                    E_upper = float(Ea[idx]); break
-    # For simple active (no passive, no Epeak): E_upper = None
-    # The min-curvature window selection finds the correct Tafel region directly.
-
-    if E_upper is not None:
-        act_mask = base_mask & (Ea <= E_upper)
-        if np.sum(act_mask) >= CFG["min_w_ano"]:
-            base_mask = act_mask
-
-    Ex, Yx = Ea[base_mask], lgia[base_mask]
-
-    # ── Step 3: Passive / Transpassive detection ─────────────────────────────
-
+    # ── Passive / Transpassive detection ─────────────────────────────────────
     if len(Ea) > 8:
-        lgia_sm = savgol_filter(lgia, max(5, min(11, len(Ea)//2*2-1)), 3, mode="interp")
-        dlg = np.gradient(lgia_sm, Ea); adlg = np.abs(dlg)
-        p10 = np.percentile(adlg, 10)
-        p25 = np.percentile(adlg, 25)
-        # Dual threshold — more robust to high noise:
-        thr_rel = p10 * 4.0          # relative: 4× the quietest 10%
-        thr_abs = 1.5                # absolute: passive plateaus < 1.5 dec/V
-        thr = max(thr_rel, min(thr_abs, p25))
-        flat = (adlg < thr) | (adlg < thr_abs)  # OR union catches noisy data
-        runs = [(k, list(g)) for k, g in groupby(enumerate(flat), key=lambda x: x[1]) if k]
+        w_sm = max(5, min(11, len(Ea) // 2 * 2 - 1))
+        Y_sm = savgol_filter(lgia, w_sm, 3, mode="interp")
+        dlg  = np.gradient(Y_sm, Ea); adlg = np.abs(dlg)
+        p10  = np.percentile(adlg, 10); p25 = np.percentile(adlg, 25)
+        thr_rel = p10 * 4.0; thr_abs = 1.5
+        thr  = max(thr_rel, min(thr_abs, p25))
+        flat = (adlg < thr) | (adlg < thr_abs)
+        runs = [(k, list(g)) for k, g in _groupby(enumerate(flat), key=lambda x: x[1]) if k]
         for _, ri in runs:
             idxs = [s[0] for s in ri]
             span = abs(Ea[idxs[-1]] - Ea[idxs[0]])
             if len(idxs) >= 4 and span > 0.05:
-                ip_cand = float(np.median(np.abs(i[ano][si][idxs])))
-                if ip_cand < float(np.max(np.abs(i[ano]))) * 0.7:
+                ip_c = float(np.median(Ia[idxs]))
+                if ip_c < float(np.max(Ia)) * 0.7 and ip_c > 0:
                     has_passive = True
                     Epass       = float(Ea[idxs[0]])
-                    ip          = ip_cand
+                    ip          = ip_c
                     post = Ea > Ea[idxs[-1]]
                     if np.sum(post) > 3:
                         post_dlg = dlg[np.where(post)[0]]
                         post_E   = Ea[np.where(post)[0]]
-                        trans_thr = max(thr, 1.5)
-                        rising = np.where(post_dlg > trans_thr)[0]
-                        if len(rising) > 0:
-                            has_trans = True
-                            Etrans    = float(post_E[rising[0]])
+                        rising   = np.where(post_dlg > max(thr, 1.5))[0]
+                        if len(rising):
+                            has_trans = True; Etrans = float(post_E[rising[0]])
                     break
 
-    # ── Step 4: Minimum-curvature window in active zone ───────────────────────
-    if len(Ex) < CFG["min_w_ano"]:
+    # ── Epeak detection ──────────────────────────────────────────────────────
+    Epeak_detected = None
+    w_pk  = max(5, min(9, len(Ea) // 2 * 2 - 1))
+    lgia_pk = savgol_filter(lgia, w_pk, 3, mode="interp")
+    dY_pk   = np.gradient(lgia_pk, Ea)
+    sc_idx  = np.where(np.diff(np.sign(dY_pk)) < 0)[0]
+    cands   = [Ea[k] for k in sc_idx if Ecorr + 0.005 < Ea[k] < Ecorr + 0.250]
+    if cands:
+        Epeak_detected = float(min(cands))
+
+    # ── E_upper: active zone boundary ────────────────────────────────────────
+    # E_upper: prefer Epeak (directly measured peak current position) over Epass
+    # Epass from the passive detection can be mis-located on active-passive curves
+    # where the passive plateau onset is hard to separate from the active zone.
+    E_upper = None
+    if Epeak_detected is not None:
+        E_upper = Epeak_detected
+    elif has_passive and Epass is not None:
+        # Use Epass only when within a plausible active-zone range from Ecorr
+        if Epass < Ecorr + 0.350:
+            E_upper = Epass
+
+    # ── Active zone mask ─────────────────────────────────────────────────────
+    msk_a = (Ea > Ecorr + CFG["anod_guard"])
+    if E_upper is not None:
+        act = msk_a & (Ea <= E_upper)
+        if np.sum(act) >= CFG["min_w_ano"]:
+            msk_a = act
+
+    Eu = Ea[msk_a]; liu = np.log10(np.maximum(Ia[msk_a], TINY))
+    if len(Eu) < 4:
         return dict(ba=0.060, has_passive=has_passive, Epass=Epass, ip=ip,
                     has_trans=has_trans, Etrans=Etrans, Epeak=Epeak_detected,
                     r2=0.0, E_an=Ea, lgi_an=lgia)
 
-    w_sm = max(5, min(9, min(len(Ex)-1 if len(Ex)%2==0 else len(Ex), len(Ex)//2*2-1)))
-    if w_sm > len(Ex): w_sm = len(Ex) if len(Ex)%2==1 else len(Ex)-1
-    if w_sm < 5 or len(Ex) < 5:
-        d2Y = np.zeros(len(Ex))
-        Y_sm = Yx.copy()
-    else:
-        Y_sm = savgol_filter(Yx, w_sm, min(3, w_sm-1), mode="interp")
-        d2Y  = np.gradient(np.gradient(Y_sm, Ex), Ex)
+    # ── Inverted regression ──────────────────────────────────────────────────
+    sl, ic_int, r2, mask = _best_seg(Eu, liu, require_positive_slope=True)
+    if sl is None:
+        sl, ic_int = _theil_sen(liu, Eu)  # fallback
+        r2 = 0.0; mask = np.ones(len(Eu), bool)
 
-    best_sl_a = None; best_int_a = None; best_r2_a = 0.0
-    best_Ea0  = None; best_Ea1  = None; best_score_a = 1e18
-    MIN_W_A   = max(CFG["min_w_ano"], 4)
-
-    if len(Ex) <= 12:
-        # Sparse: fit all active points (no sub-window selection)
-        best_sl_a, best_int_a = _theil_sen(Ex, Yx)
-        best_r2_a = r2_score(Yx, best_sl_a * Ex + best_int_a)
-        best_Ea0, best_Ea1 = float(Ex[0]), float(Ex[-1])
-    else:
-        # Dense: min-curvature rolling window
-        for win in range(MIN_W_A, min(40, len(Ex) + 1)):
-            for s in range(0, len(Ex) - win + 1):
-                e = s + win
-                curv_a = float(np.mean(np.abs(d2Y[s:e])))
-                sl_a, inter_a, r_a, *_ = _lr(Ex[s:e], Yx[s:e])
-                invm_a = abs(1.0 / sl_a) * 1000 if abs(sl_a) > 1e-10 else 9999.0
-                if sl_a <= 0 or invm_a < CFG["beta_min"]*1000 or invm_a > CFG["beta_max_a"]*1000:
-                    continue
-                if r_a ** 2 < 0.90:
-                    continue
-                score_a = curv_a / max(r_a ** 2, 0.01) / np.log1p(win)
-                if score_a < best_score_a:
-                    best_score_a = score_a
-                    best_sl_a, best_int_a, best_r2_a = sl_a, inter_a, r_a ** 2
-                    best_Ea0, best_Ea1 = float(Ex[s]), float(Ex[e - 1])
-
-        if best_sl_a is None:
-            # Fallback: all active points
-            best_sl_a, best_int_a = _theil_sen(Ex, Yx)
-            best_r2_a = r2_score(Yx, best_sl_a * Ex + best_int_a)
-            best_Ea0, best_Ea1 = float(Ex[0]), float(Ex[-1])
-
-    # Refine with Theil-Sen + Huber
-    win_mask_a = (Ex >= best_Ea0 - 1e-9) & (Ex <= best_Ea1 + 1e-9)
-    Ex_w, Yx_w = Ex[win_mask_a], Yx[win_mask_a]
-    if len(Ex_w) >= 2:
-        sl_ts_a, b_ts_a = _theil_sen(Ex_w, Yx_w)
-        sl_hb_a, b_hb_a = _huber_fit(Ex_w, Yx_w, best_sl_a, best_int_a)
-        def _r2la(sl, b): return r2_score(Yx_w, sl * Ex_w + b)
-        cands_a = [(sl_ts_a, b_ts_a, _r2la(sl_ts_a, b_ts_a)),
-                   (sl_hb_a, b_hb_a, _r2la(sl_hb_a, b_hb_a)),
-                   (best_sl_a, best_int_a, best_r2_a)]
-        sl_ref_a, b_ref_a, r2_win_a = max(cands_a, key=lambda t: t[2])
-        if sl_ref_a <= 0 or abs(1.0/sl_ref_a)*1000 > CFG["beta_max_a"]*1000*1.5:
-            sl_ref_a, b_ref_a, r2_win_a = best_sl_a, best_int_a, best_r2_a
-    else:
-        sl_ref_a, b_ref_a, r2_win_a = best_sl_a, best_int_a, best_r2_a
-
-    ba = min(abs(1.0 / sl_ref_a), CFG["beta_max_a"]) if abs(sl_ref_a) > 1e-9 else 0.060
-    # Clip win_a right edge to E_upper (active zone boundary) for clean display
+    ba_v = min(abs(sl), CFG["beta_max_a"]) if abs(sl) > 1e-9 else 0.060
+    win_lo = float(Eu[mask].min()); win_hi = float(Eu[mask].max())
+    # Clip window to active zone
     if E_upper is not None:
-        best_Ea1 = min(best_Ea1, E_upper)
-        if best_Ea1 <= best_Ea0:
-            best_Ea1 = best_Ea0 + 0.005
+        win_hi = min(win_hi, E_upper)
+    if win_hi <= win_lo:
+        win_hi = win_lo + 0.005
 
     return dict(
-        ba=ba, has_passive=has_passive, Epass=Epass, ip=ip,
+        ba=ba_v, has_passive=has_passive, Epass=Epass, ip=ip,
         has_trans=has_trans, Etrans=Etrans, Epeak=Epeak_detected,
-        r2=float(r2_win_a),
-        E_an=Ea, lgi_an=lgia,
-        slope_a=sl_ref_a, intercept_a=b_ref_a,
-        win_a=(best_Ea0, best_Ea1)
+        r2=float(r2),
+        slope_a=float(sl), intercept_a=float(ic_int),
+        win_a=(win_lo, win_hi),
+        E_an=Ea, lgi_an=lgia
     )
 
 
@@ -642,14 +515,26 @@ def classify_curve(cat_res, an_res):
 # TAFEL INTERSECTION  (Ecorr and icorr from classical Tafel extrapolation)
 # ─────────────────────────────────────────────────────────────────────────────
 def tafel_intersection(cat_res, an_res):
+    """
+    Find Ecorr / icorr as the intersection of the cathodic and anodic Tafel lines.
+
+    Both lines are in the INVERTED convention: E = slope * log|i| + intercept.
+    Cathodic slope < 0, anodic slope > 0.
+
+    Intersection:
+        sc * log|i| + ic = sa * log|i| + ia
+        log|i| = (ia - ic) / (sc - sa)
+        E_star = sc * log|i| + ic
+    """
     if ("slope_c" in cat_res and "intercept_c" in cat_res and
         "slope_a" in an_res  and "intercept_a" in an_res):
-        mc = float(cat_res["slope_c"]); bc_int = float(cat_res["intercept_c"])
-        ma = float(an_res["slope_a"]);  ba_int = float(an_res["intercept_a"])
-        if abs(ma - mc) > 1e-12:
-            E_star = (bc_int - ba_int) / (ma - mc)
-            logI_star = ma * E_star + ba_int
-            i_star = 10.0 ** logI_star
+        sc = float(cat_res["slope_c"]); ic_int = float(cat_res["intercept_c"])
+        sa = float(an_res["slope_a"]);  ia_int = float(an_res["intercept_a"])
+        denom = sc - sa
+        if abs(denom) > 1e-12:
+            logI_star = (ia_int - ic_int) / denom
+            E_star    = sc * logI_star + ic_int
+            i_star    = 10.0 ** logI_star
             return float(E_star), float(i_star), float(logI_star)
     return None
 
