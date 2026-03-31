@@ -227,6 +227,8 @@ def pol_model(E, p, ct="PT"):
     w_p   = sig(E - Ep, 1.0 / kp)
     i_ano = (1.0 - w_p) * i_act + w_p * ip
     if ct == "P": return i_ano - i_cat
+    # Physical constraint: Etrans must be > Epass + 20mV (minimum passive plateau width)
+    Et    = max(Et, Ep + 0.020)
     w_t   = sig(E - Et, 1.0 / kt)
     # Transpassive: fixed slope 0.18 V/dec (PolCurveFit default), amplitude = p[9]=it
     i_tp  = ip + max(it, 1e-30) * np.exp(np.clip(2.303 * (E - Et) / 0.180, -60, 60))
@@ -464,9 +466,16 @@ def fit_anodic(E, i, Ecorr):
             E_upper = Epass
 
     # ── Active zone mask ─────────────────────────────────────────────────────
+    # Always try both the configured guard (30 mV default) and a minimal guard
+    # (10 mV). Use whichever gives more points — a wider search range means
+    # the 40%-window scorer has more candidates and can find the true Tafel region.
+    # This handles stainless steel where the active zone is only 20-40 mV wide.
     msk_a = (Ea > Ecorr + CFG["anod_guard"])
     if E_upper is not None:
-        act = msk_a & (Ea <= E_upper)
+        act_std = msk_a & (Ea <= E_upper)
+        act_min = (Ea > Ecorr + 0.010) & (Ea <= E_upper)
+        # Pick whichever has more points (larger range → better window scoring)
+        act = act_min if np.sum(act_min) > np.sum(act_std) else act_std
         if np.sum(act) >= CFG["min_w_ano"]:
             msk_a = act
 
@@ -569,6 +578,9 @@ def _make_p0(Ecorr, cat, an, ct, E_max):
     ip  = an["ip"] if an["has_passive"] else ic * 0.05
     Et  = an["Etrans"] if an["has_trans"] and an["Etrans"] is not None else E_max * 0.6
     it = ip * 0.5 if an.get('has_trans') else ic * 0.01  # transpassive current amplitude
+    # Ensure at least 150 mV between Epass and Etrans in p0 so optimizer
+    # starts away from the degenerate Epass≈Etrans collapsed-plateau local minimum.
+    Et = max(Et, Ep + 0.150)
     return np.array([Ecorr, ic, ba, bc, Ep, 0.008, ip, Et, 0.050, it, iL])
 
 
@@ -587,10 +599,12 @@ def _build_bounds(Ecorr, cat, an, ct, E_min, E_max, E_span):
     bc_fit = float(cat["bc"])
     iL_est = max(cat["iL"], ic * 10)
 
-    # Tafel slopes: moderate band
-    ba_lo = max(ba_fit * 0.40, 0.020)
+    # Tafel slopes: generous lower bound.
+    # ba_fit may be inflated (e.g. 248 mV/dec when active zone includes passive data).
+    # ba_fit*0.15 ensures the true ba is always reachable even if local estimate is 3× high.
+    ba_lo = max(ba_fit * 0.15, 0.020)
     ba_hi = min(ba_fit * 3.00, CFG["beta_max_a"])
-    bc_lo = max(bc_fit * 0.40, 0.020)
+    bc_lo = max(bc_fit * 0.15, 0.020)
     bc_hi = min(bc_fit * 3.00, CFG["beta_max_c"])
 
     # Epass bounded tightly around Epeak (within ±50mV) to prevent drift
@@ -603,20 +617,26 @@ def _build_bounds(Ecorr, cat, an, ct, E_min, E_max, E_span):
     iL_lo = max(ic * 3.0,   1e-13)
     iL_hi = min(iL_est * 20, 1.0)
 
+    # Etrans_lo must be at least Ep_lo + 100 mV to prevent the optimizer from
+    # collapsing the passive plateau to zero width (Epass ≈ Etrans).
+    Et_lo = max(Ecorr + 0.08, Ep_lo + 0.100)
+    Et_hi = min(E_max + 0.1, Ecorr + E_span * 0.9)
+    if Et_hi < Et_lo + 0.050: Et_hi = Et_lo + 0.300  # safety: always have range
+
     lo = np.array([max(E_min, Ecorr - 0.08),   # Ecorr ±80mV
                    max(ic * 1e-3, 1e-15),        # icorr
                    ba_lo, bc_lo,
                    Ep_lo, 0.001,                  # Epass, k_pass
                    max(ic * 1e-4, 1e-16),         # ip
-                   Ecorr + 0.08, 0.005,           # Etrans, k_trans
+                   Et_lo, 0.005,                  # Etrans ≥ Ep_lo+100mV, k_trans
                    max(ic * 1e-5, 1e-16),         # it transpassive amplitude lo
                    iL_lo])
-    hi = np.array([min(E_max, Ecorr + 0.04),    # Ecorr
+    hi = np.array([min(E_max, Ecorr + 0.08),    # Ecorr ±80mV
                    min(ic * 1e4, 1.0),           # icorr
                    ba_hi, bc_hi,
                    Ep_hi, 0.080,                  # Epass, k_pass
                    min(ic * 1e4, 1.0),            # ip
-                   min(E_max + 0.1, Ecorr + E_span * 0.9), 0.200,  # Etrans, k_trans
+                   Et_hi, 0.250,                  # Etrans, k_trans
                    min(ic * 1e5, 10.0),            # it transpassive amplitude hi
                    iL_hi])
     lo = np.minimum(lo, hi - 1e-12)
@@ -975,12 +995,12 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
                 wc0, wc1 = float(cat_res["win_c"][0]), float(cat_res["win_c"][1])
                 # Solid line in window
                 E_win = np.linspace(wc0, wc1, 100)
-                ax.plot(E_win, sc*E_win + ic_int, "-", color="#8e44ad", lw=2.2, zorder=5,
+                ax.plot(E_win, (E_win-ic_int)/sc, "-", color="#8e44ad", lw=2.2, zorder=5,
                         label=f"βc = {min(abs(1/sc), CFG['beta_max_c'])*1000:.0f} mV/dec")
                 # Dashed extension to Ecorr
                 if extend_tafel and wc1 < ecorr_display:
                     E_ext = np.linspace(wc1, ecorr_display, 80)
-                    ax.plot(E_ext, sc*E_ext + ic_int, "--", color="#8e44ad",
+                    ax.plot(E_ext, (E_ext-ic_int)/sc, "--", color="#8e44ad",
                             lw=1.4, alpha=0.50, zorder=4)
             ax.axvline(ecorr_display, color="#e84393", ls="--", lw=1.0, alpha=0.7)
             ax.axhline(logIc_disp, color="#e84393", ls=":", lw=0.9, alpha=0.7)
@@ -1029,12 +1049,12 @@ def make_figure(E, i_obs, best_p, ct, sample_name, cat_res, an_res,
                 wa1 = min(float(an_res["win_a"][1]), act_up)
                 if wa1 > wa0:
                     E_win_a = np.linspace(wa0, wa1, 100)
-                    ax.plot(E_win_a, sa*E_win_a + ia_int, "-", color="#e67e22", lw=2.2, zorder=5,
+                    ax.plot(E_win_a, (E_win_a-ia_int)/sa, "-", color="#e67e22", lw=2.2, zorder=5,
                             label=f"βa = {min(abs(1/sa), CFG['beta_max_a'])*1000:.0f} mV/dec")
                     # Dashed extension to Ecorr
                     if extend_tafel and ecorr_display < wa0:
                         E_ext_a = np.linspace(ecorr_display, wa0, 80)
-                        ax.plot(E_ext_a, sa*E_ext_a + ia_int, "--", color="#e67e22",
+                        ax.plot(E_ext_a, (E_ext_a-ia_int)/sa, "--", color="#e67e22",
                                 lw=1.4, alpha=0.50, zorder=4)
             ax.axvline(ecorr_display, color="#e84393", ls="--", lw=1.0, alpha=0.7)
             ax.axhline(logIc_disp, color="#e84393", ls=":", lw=0.9, alpha=0.7)
